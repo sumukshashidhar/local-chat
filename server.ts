@@ -16,9 +16,66 @@ interface ChatRequest {
   messages: Array<{ role: "user" | "assistant"; content: string }>;
 }
 
+function validateRequest(body: unknown): { valid: true; data: ChatRequest } | { valid: false; error: string } {
+  if (!body || typeof body !== "object") {
+    return { valid: false, error: "Invalid request body" };
+  }
+
+  const { model, system, messages } = body as Record<string, unknown>;
+
+  // Validate model
+  if (!model || !MODELS.includes(model as Model)) {
+    return { valid: false, error: `Invalid model. Must be one of: ${MODELS.join(", ")}` };
+  }
+
+  // Validate system (optional, must be string if provided)
+  if (system !== undefined && typeof system !== "string") {
+    return { valid: false, error: "System prompt must be a string" };
+  }
+
+  // Validate messages
+  if (!Array.isArray(messages)) {
+    return { valid: false, error: "Messages must be an array" };
+  }
+
+  for (const msg of messages) {
+    if (!msg || typeof msg !== "object") {
+      return { valid: false, error: "Each message must be an object" };
+    }
+    if (msg.role !== "user" && msg.role !== "assistant") {
+      return { valid: false, error: "Message role must be 'user' or 'assistant'" };
+    }
+    if (typeof msg.content !== "string") {
+      return { valid: false, error: "Message content must be a string" };
+    }
+  }
+
+  return {
+    valid: true,
+    data: { model: model as Model, system: (system as string) || "", messages: messages as ChatRequest["messages"] },
+  };
+}
+
 async function handleChat(req: Request): Promise<Response> {
-  const body: ChatRequest = await req.json();
-  const { model, system, messages } = body;
+  let body: unknown;
+  try {
+    body = await req.json();
+  } catch {
+    return new Response(JSON.stringify({ error: "Invalid JSON" }), {
+      status: 400,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
+  const validation = validateRequest(body);
+  if (!validation.valid) {
+    return new Response(JSON.stringify({ error: validation.error }), {
+      status: 400,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
+  const { model, system, messages } = validation.data;
 
   // Build system content with 1-hour caching
   const systemContent: Anthropic.TextBlockParam[] = system

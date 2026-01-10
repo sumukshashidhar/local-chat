@@ -64,4 +64,48 @@ describe("Chat API", () => {
 
     expect(receivedData).toBe(true);
   });
+
+  test("POST /api/chat returns 400 for invalid model", async () => {
+    const res = await fetch(`${BASE_URL}/api/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "invalid-model",
+        system: "",
+        messages: [{ role: "user", content: "Test" }],
+      }),
+    });
+
+    expect(res.status).toBe(400);
+    const data = await res.json();
+    expect(data.error).toContain("Invalid model");
+  });
+
+  test("POST /api/chat returns 400 for invalid messages", async () => {
+    const res = await fetch(`${BASE_URL}/api/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "claude-haiku-3-5-20241022",
+        system: "",
+        messages: "not an array",
+      }),
+    });
+
+    expect(res.status).toBe(400);
+    const data = await res.json();
+    expect(data.error).toContain("Messages must be an array");
+  });
+
+  test("POST /api/chat returns 400 for invalid JSON", async () => {
+    const res = await fetch(`${BASE_URL}/api/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "not json",
+    });
+
+    expect(res.status).toBe(400);
+    const data = await res.json();
+    expect(data.error).toContain("Invalid JSON");
+  });
 });
