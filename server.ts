@@ -25,15 +25,26 @@ async function handleChat(req: Request): Promise<Response> {
     ? [{ type: "text", text: system, cache_control: { type: "ephemeral", ttl: "1h" } }]
     : [];
 
+  // Build messages with cache control on conversation history
+  // Cache the last message before the current turn to cache the entire prefix
+  const formattedMessages: Anthropic.MessageParam[] = messages.map((m, i) => {
+    const isLastBeforeCurrent = i === messages.length - 2;
+    const content: Anthropic.ContentBlockParam[] = [
+      {
+        type: "text",
+        text: m.content,
+        ...(isLastBeforeCurrent && { cache_control: { type: "ephemeral", ttl: "1h" } }),
+      },
+    ];
+    return { role: m.role, content };
+  });
+
   // Stream response
   const stream = await client.messages.stream({
     model,
     max_tokens: 8192,
     system: systemContent,
-    messages: messages.map((m) => ({
-      role: m.role,
-      content: m.content,
-    })),
+    messages: formattedMessages,
   });
 
   // Create SSE response
