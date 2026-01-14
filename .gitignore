@@ -210,3 +210,6 @@ __marimo__/
 node_modules/
 bun.lock
 bun.lockb
+
+# Chat logs
+logs/

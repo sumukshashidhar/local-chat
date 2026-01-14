@@ -1,11 +1,53 @@
 import Anthropic from "@anthropic-ai/sdk";
+import { mkdir } from "node:fs/promises";
 
 const client = new Anthropic();
+const LOGS_DIR = "./logs";
+const LOGS_FILE = `${LOGS_DIR}/chat_logs.json`;
+
+// Ensure logs directory exists
+await mkdir(LOGS_DIR, { recursive: true });
+
+interface ChatLog {
+  id: string;
+  timestamp: string;
+  model: string;
+  system_prompt: string;
+  messages: Array<{ role: "user" | "assistant"; content: string }>;
+  response: string;
+  usage: {
+    input_tokens: number;
+    output_tokens: number;
+    cache_creation_input_tokens?: number;
+    cache_read_input_tokens?: number;
+  };
+  latency: {
+    time_to_first_token_ms: number;
+    total_time_ms: number;
+  };
+  error?: string;
+}
+
+async function saveChatLog(log: ChatLog): Promise<void> {
+  const file = Bun.file(LOGS_FILE);
+  let logs: ChatLog[] = [];
+
+  if (await file.exists()) {
+    try {
+      logs = await file.json();
+    } catch {
+      logs = [];
+    }
+  }
+
+  logs.push(log);
+  await Bun.write(LOGS_FILE, JSON.stringify(logs, null, 2));
+}
 
 const MODELS = [
-  "claude-opus-4-5-20250514",
-  "claude-sonnet-4-20250514",
-  "claude-haiku-3-5-20241022",
+  "claude-opus-4-5-20251101",
+  "claude-haiku-4-5-20251001",
+  "claude-sonnet-4-5-20250929",
 ] as const;
 
 type Model = (typeof MODELS)[number];
@@ -77,6 +119,12 @@ async function handleChat(req: Request): Promise<Response> {
 
   const { model, system, messages } = validation.data;
 
+  // Track timing
+  const startTime = performance.now();
+  let timeToFirstToken: number | null = null;
+  let fullResponse = "";
+  const logId = crypto.randomUUID();
+
   // Build system content with 1-hour caching
   const systemContent: Anthropic.TextBlockParam[] = system
     ? [{ type: "text", text: system, cache_control: { type: "ephemeral", ttl: "1h" } }]
@@ -111,11 +159,40 @@ async function handleChat(req: Request): Promise<Response> {
       try {
         for await (const event of stream) {
           if (event.type === "content_block_delta" && event.delta.type === "text_delta") {
+            // Track time to first token
+            if (timeToFirstToken === null) {
+              timeToFirstToken = performance.now() - startTime;
+            }
+            fullResponse += event.delta.text;
+
             const data = JSON.stringify({ type: "delta", text: event.delta.text });
             controller.enqueue(encoder.encode(`data: ${data}\n\n`));
           } else if (event.type === "message_stop") {
             // Get final message for usage stats
             const finalMessage = await stream.finalMessage();
+            const totalTime = performance.now() - startTime;
+
+            // Save chat log
+            const chatLog: ChatLog = {
+              id: logId,
+              timestamp: new Date().toISOString(),
+              model,
+              system_prompt: system,
+              messages,
+              response: fullResponse,
+              usage: {
+                input_tokens: finalMessage.usage.input_tokens,
+                output_tokens: finalMessage.usage.output_tokens,
+                cache_creation_input_tokens: (finalMessage.usage as Record<string, unknown>).cache_creation_input_tokens as number | undefined,
+                cache_read_input_tokens: (finalMessage.usage as Record<string, unknown>).cache_read_input_tokens as number | undefined,
+              },
+              latency: {
+                time_to_first_token_ms: Math.round(timeToFirstToken ?? totalTime),
+                total_time_ms: Math.round(totalTime),
+              },
+            };
+            saveChatLog(chatLog).catch(console.error);
+
             const data = JSON.stringify({
               type: "done",
               usage: finalMessage.usage,
@@ -125,6 +202,25 @@ async function handleChat(req: Request): Promise<Response> {
         }
       } catch (error) {
         const errorMsg = error instanceof Error ? error.message : "Unknown error";
+        const totalTime = performance.now() - startTime;
+
+        // Log errors too
+        const chatLog: ChatLog = {
+          id: logId,
+          timestamp: new Date().toISOString(),
+          model,
+          system_prompt: system,
+          messages,
+          response: fullResponse,
+          usage: { input_tokens: 0, output_tokens: 0 },
+          latency: {
+            time_to_first_token_ms: Math.round(timeToFirstToken ?? totalTime),
+            total_time_ms: Math.round(totalTime),
+          },
+          error: errorMsg,
+        };
+        saveChatLog(chatLog).catch(console.error);
+
         const data = JSON.stringify({ type: "error", error: errorMsg });
         controller.enqueue(encoder.encode(`data: ${data}\n\n`));
       } finally {
