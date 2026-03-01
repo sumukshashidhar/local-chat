@@ -4,32 +4,84 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Chat</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:ital,wght@0,400..700;1,400..700&family=JetBrains+Mono:ital,wght@0,400;0,500;1,400&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
   <div id="app">
-    <header>
-      <select id="model-select">
-        <option value="claude-opus-4-5-20251101">Opus 4.5</option>
-        <option value="claude-haiku-4-5-20251001">Haiku 4.5</option>
-        <option value="claude-sonnet-4-5-20250929">Sonnet 4.5</option>
-      </select>
-      <button id="system-toggle" type="button">System</button>
-    </header>
+    <aside id="sidebar" class="sidebar">
+      <div class="sidebar-header">
+        <span class="sidebar-title">History</span>
+        <button id="new-chat-btn" class="sidebar-new-btn">
+          <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M7 1v12M1 7h12" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+          New
+        </button>
+      </div>
+      <div id="chat-list" class="chat-list"></div>
+    </aside>
 
-    <div id="system-panel" class="hidden">
-      <textarea id="system-prompt" placeholder="Enter system prompt..."></textarea>
+    <div class="sidebar-overlay"></div>
+
+    <div id="main-content">
+      <header>
+        <button id="sidebar-toggle" type="button" class="icon-btn" title="Toggle sidebar">
+          <svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M2.5 4.5h13M2.5 9h13M2.5 13.5h13" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
+        </button>
+        <div class="header-controls">
+          <select id="provider-select"></select>
+          <select id="model-select">
+            <option value="claude-opus-4-5-20251101">Opus 4.5</option>
+            <option value="claude-opus-4-6">Opus 4.6</option>
+            <option value="claude-sonnet-4-6">Sonnet 4.6</option>
+            <option value="claude-haiku-4-5-20251001">Haiku 4.5</option>
+            <option value="claude-sonnet-4-5-20250929">Sonnet 4.5</option>
+          </select>
+          <label class="toggle-label">
+            <input type="checkbox" id="thinking-toggle">
+            <span>Think</span>
+          </label>
+          <button id="system-toggle" type="button" class="header-btn">Sys</button>
+        </div>
+        <button id="clear-btn" type="button" class="icon-btn" title="New chat">
+          <svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M9 2.5v13M2.5 9h13" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
+        </button>
+      </header>
+
+      <div id="system-panel">
+        <div class="system-panel-inner">
+          <textarea id="system-prompt" placeholder="System prompt..."></textarea>
+        </div>
+      </div>
+
+      <main id="messages">
+        <div class="empty-state">New conversation</div>
+      </main>
+
+      <footer>
+        <form id="chat-form">
+          <textarea id="input" placeholder="Send a message..." rows="1"></textarea>
+          <button type="submit" id="send-btn" title="Send">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M12 19V5M5 12l7-7 7 7" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </button>
+        </form>
+      </footer>
     </div>
-
-    <main id="messages"></main>
-
-    <footer>
-      <form id="chat-form">
-        <textarea id="input" placeholder="Message..." rows="1"></textarea>
-        <button type="submit" id="send-btn">Send</button>
-      </form>
-    </footer>
   </div>
+
+  <dialog id="app-dialog">
+    <form method="dialog">
+      <p class="dialog-message"></p>
+      <input class="dialog-input" type="text">
+      <div class="dialog-actions">
+        <button value="cancel" type="button" class="dialog-cancel">Cancel</button>
+        <button value="confirm" type="submit" class="dialog-confirm">Confirm</button>
+      </div>
+    </form>
+  </dialog>
+
+  <div id="toasts" aria-live="polite"></div>
   <script src="/app.js"></script>
 </body>
 </html>

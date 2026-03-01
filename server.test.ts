@@ -3,14 +3,18 @@ import { expect, test, describe } from "bun:test";
 const BASE_URL = "http://localhost:3000";
 
 describe("Chat API", () => {
-  test("GET /api/models returns available models", async () => {
+  test("GET /api/models returns available models and providers", async () => {
     const res = await fetch(`${BASE_URL}/api/models`);
     const data = await res.json();
 
     expect(res.status).toBe(200);
-    expect(data.models).toContain("claude-opus-4-5-20250514");
-    expect(data.models).toContain("claude-sonnet-4-20250514");
-    expect(data.models).toContain("claude-haiku-3-5-20241022");
+    expect(data.models).toContain("claude-opus-4-6");
+    expect(data.models).toContain("claude-opus-4-5-20251101");
+    expect(data.models).toContain("claude-sonnet-4-6");
+    expect(data.models).toContain("claude-sonnet-4-5-20250929");
+    expect(data.models).toContain("claude-haiku-4-5-20251001");
+    expect(Array.isArray(data.providers)).toBe(true);
+    expect(data.providers.length).toBeGreaterThan(0);
   });
 
   test("GET / serves index.html", async () => {
@@ -19,6 +23,7 @@ describe("Chat API", () => {
 
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toBe("text/html");
+    expect(res.headers.get("cache-control")).toBe("no-cache");
     expect(text).toContain("<!DOCTYPE html>");
   });
 
@@ -27,6 +32,7 @@ describe("Chat API", () => {
 
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toBe("text/css");
+    expect(res.headers.get("cache-control")).toBe("no-cache");
   });
 
   test("POST /api/chat streams response", async () => {
@@ -34,9 +40,10 @@ describe("Chat API", () => {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        model: "claude-haiku-3-5-20241022",
+        model: "claude-haiku-4-5-20251001",
         system: "You are a helpful assistant. Respond with exactly: OK",
         messages: [{ role: "user", content: "Test" }],
+        session_id: "test-session-123",
       }),
     });
 
@@ -73,6 +80,7 @@ describe("Chat API", () => {
         model: "invalid-model",
         system: "",
         messages: [{ role: "user", content: "Test" }],
+        session_id: "test-session-123",
       }),
     });
 
@@ -86,15 +94,32 @@ describe("Chat API", () => {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        model: "claude-haiku-3-5-20241022",
+        model: "claude-haiku-4-5-20251001",
         system: "",
         messages: "not an array",
+        session_id: "test-session-123",
       }),
     });
 
     expect(res.status).toBe(400);
     const data = await res.json();
     expect(data.error).toContain("Messages must be an array");
+  });
+
+  test("POST /api/chat returns 400 for missing session_id", async () => {
+    const res = await fetch(`${BASE_URL}/api/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "claude-haiku-4-5-20251001",
+        system: "",
+        messages: [{ role: "user", content: "Test" }],
+      }),
+    });
+
+    expect(res.status).toBe(400);
+    const data = await res.json();
+    expect(data.error).toContain("session_id is required");
   });
 
   test("POST /api/chat returns 400 for invalid JSON", async () => {
