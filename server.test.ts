@@ -1,20 +1,45 @@
 import { expect, test, describe } from "bun:test";
 
-const BASE_URL = "http://localhost:3000";
+const BASE_URL = process.env.TEST_BASE_URL || "http://localhost:3000";
+
+async function getAnyModel(): Promise<string> {
+  const geminiRes = await fetch(`${BASE_URL}/api/models?q=google/gemini&limit=1`);
+  if (geminiRes.ok) {
+    const gemini = await geminiRes.json();
+    if (gemini.models?.[0]?.id) return gemini.models[0].id as string;
+  }
+
+  const res = await fetch(`${BASE_URL}/api/models?limit=1`);
+  if (!res.ok) {
+    throw new Error(`Failed to fetch models: ${res.status}`);
+  }
+  const data = await res.json();
+  const id = data.models?.[0]?.id;
+  if (!id || typeof id !== "string") {
+    throw new Error("No model IDs returned from /api/models");
+  }
+  return id;
+}
 
 describe("Chat API", () => {
-  test("GET /api/models returns available models and providers", async () => {
+  test("GET /api/models returns OpenRouter model catalog", async () => {
     const res = await fetch(`${BASE_URL}/api/models`);
     const data = await res.json();
 
     expect(res.status).toBe(200);
-    expect(data.models).toContain("claude-opus-4-6");
-    expect(data.models).toContain("claude-opus-4-5-20251101");
-    expect(data.models).toContain("claude-sonnet-4-6");
-    expect(data.models).toContain("claude-sonnet-4-5-20250929");
-    expect(data.models).toContain("claude-haiku-4-5-20251001");
-    expect(Array.isArray(data.providers)).toBe(true);
-    expect(data.providers.length).toBeGreaterThan(0);
+    expect(data.provider).toBe("openrouter");
+    expect(Array.isArray(data.models)).toBe(true);
+    expect(data.models.length).toBeGreaterThan(0);
+    expect(typeof data.models[0].id).toBe("string");
+  });
+
+  test("GET /api/themes returns theme metadata", async () => {
+    const res = await fetch(`${BASE_URL}/api/themes`);
+    const data = await res.json();
+
+    expect(res.status).toBe(200);
+    expect(data.source).toBe("obsidian");
+    expect(Array.isArray(data.themes)).toBe(true);
   });
 
   test("GET / serves index.html", async () => {
@@ -36,11 +61,12 @@ describe("Chat API", () => {
   });
 
   test("POST /api/chat streams response", async () => {
+    const model = await getAnyModel();
     const res = await fetch(`${BASE_URL}/api/chat`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        model: "claude-haiku-4-5-20251001",
+        model,
         system: "You are a helpful assistant. Respond with exactly: OK",
         messages: [{ role: "user", content: "Test" }],
         session_id: "test-session-123",
@@ -72,12 +98,12 @@ describe("Chat API", () => {
     expect(receivedData).toBe(true);
   });
 
-  test("POST /api/chat returns 400 for invalid model", async () => {
+  test("POST /api/chat returns 400 for missing model", async () => {
     const res = await fetch(`${BASE_URL}/api/chat`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        model: "invalid-model",
+        model: "",
         system: "",
         messages: [{ role: "user", content: "Test" }],
         session_id: "test-session-123",
@@ -86,15 +112,16 @@ describe("Chat API", () => {
 
     expect(res.status).toBe(400);
     const data = await res.json();
-    expect(data.error).toContain("Invalid model");
+    expect(data.error).toContain("model is required");
   });
 
   test("POST /api/chat returns 400 for invalid messages", async () => {
+    const model = await getAnyModel();
     const res = await fetch(`${BASE_URL}/api/chat`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        model: "claude-haiku-4-5-20251001",
+        model,
         system: "",
         messages: "not an array",
         session_id: "test-session-123",
@@ -107,11 +134,12 @@ describe("Chat API", () => {
   });
 
   test("POST /api/chat returns 400 for missing session_id", async () => {
+    const model = await getAnyModel();
     const res = await fetch(`${BASE_URL}/api/chat`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        model: "claude-haiku-4-5-20251001",
+        model,
         system: "",
         messages: [{ role: "user", content: "Test" }],
       }),

@@ -20,8 +20,9 @@ const state = {
 // ── DOM Refs ──
 
 const $ = (sel) => document.querySelector(sel);
-const providerSelect = $("#provider-select");
+const modelSearchInput = $("#model-search");
 const modelSelect = $("#model-select");
+const themeSelect = $("#theme-select");
 const systemToggle = $("#system-toggle");
 const systemPanel = $("#system-panel");
 const systemPrompt = $("#system-prompt");
@@ -33,6 +34,9 @@ const thinkingToggle = $("#thinking-toggle");
 const clearBtn = $("#clear-btn");
 const overlay = $(".sidebar-overlay");
 const toastsEl = $("#toasts");
+let allModels = [];
+let allThemes = [];
+let unsupportedThinkingModelWarned = "";
 
 let sidebar, sidebarToggle, newChatBtn, chatList;
 
@@ -614,16 +618,29 @@ async function streamResponse() {
   }
 
   try {
+    const selectedModel = modelSelect.value || modelSearchInput.value.trim();
+    if (!selectedModel) {
+      throw new Error("Select a model before sending");
+    }
+    if (!modelSelect.value && selectedModel) {
+      ensureModelOption(selectedModel, `Custom: ${selectedModel}`);
+      modelSelect.value = selectedModel;
+    }
+    const supportsThinking = modelSupportsThinking(selectedModel);
+    if (state.thinkingEnabled && !supportsThinking && unsupportedThinkingModelWarned !== selectedModel) {
+      showToast("Thinking is not supported by this model; sending normally.", "info", 3500);
+      unsupportedThinkingModelWarned = selectedModel;
+    }
+
     const response = await fetch("/api/chat", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        provider: providerSelect.value,
-        model: modelSelect.value,
+        model: selectedModel,
         system: systemPrompt.value,
         messages: state.messages,
         session_id: state.sessionId,
-        thinking: state.thinkingEnabled
+        thinking: state.thinkingEnabled && supportsThinking
           ? { enabled: true, budget_tokens: 10000 }
           : undefined,
       }),
@@ -791,12 +808,13 @@ async function saveCurrentChat() {
     return;
   }
 
+  const selectedModel = modelSelect.value || modelSearchInput.value.trim() || FALLBACK_MODEL;
   const payload = {
     id: state.currentChatId,
     title: null,
     sessionId: state.sessionId,
-    provider: providerSelect.value,
-    model: modelSelect.value,
+    provider: "openrouter",
+    model: selectedModel,
     systemPrompt: systemPrompt.value,
     thinkingEnabled: state.thinkingEnabled,
     messages: state.messages,
@@ -864,8 +882,14 @@ async function loadChat(chatId) {
     state.isDirty = false;
 
     // Restore UI controls
-    if (chat.provider) providerSelect.value = chat.provider;
-    modelSelect.value = chat.model;
+    if (chat.model) {
+      const selected = selectModel(chat.model);
+      if (!selected) {
+        ensureModelOption(chat.model, `Custom: ${chat.model}`);
+        modelSelect.value = chat.model;
+        modelSearchInput.value = chat.model;
+      }
+    }
     systemPrompt.value = chat.systemPrompt || "";
     thinkingToggle.checked = chat.thinkingEnabled;
 
@@ -1220,8 +1244,13 @@ thinkingToggle.addEventListener("change", () => {
 clearBtn.addEventListener("click", () => startNewChat());
 
 // Settings changes trigger save
-providerSelect.addEventListener("change", () => triggerAutoSave());
-modelSelect.addEventListener("change", () => triggerAutoSave());
+modelSelect.addEventListener("change", () => {
+  modelSearchInput.value = modelSelect.value;
+  triggerAutoSave();
+});
+themeSelect.addEventListener("change", () => {
+  applyTheme(themeSelect.value);
+});
 systemPrompt.addEventListener("input", () => triggerAutoSave());
 
 // Auto-resize input
@@ -1251,39 +1280,227 @@ input.addEventListener("keydown", (e) => {
   }
 });
 
-// ── Provider Loading ──
+// ── Model Loading ──
 
-const PROVIDER_LABELS = {
-  anthropic: "Anthropic",
-  openrouter: "OpenRouter",
-};
+const FALLBACK_MODEL = "google/gemini-2.0-flash-001";
+const LOCAL_THEME_ID = "local";
+const THEME_STORAGE_KEY = "local-chat-theme";
+const THEME_STYLESHEET_ID = "obsidian-theme-css";
 
-async function loadProviders() {
+function modelLabel(model) {
+  if (!model.name || model.name === model.id) return model.id;
+  return `${model.name} (${model.id})`;
+}
+
+function ensureModelOption(modelId, label = modelId) {
+  let option = Array.from(modelSelect.options).find((o) => o.value === modelId);
+  if (!option) {
+    option = document.createElement("option");
+    option.value = modelId;
+    modelSelect.appendChild(option);
+  }
+  option.textContent = label;
+  return option;
+}
+
+function modelSupportsThinking(modelId) {
+  const model = allModels.find((m) => m.id === modelId);
+  const params = model?.supported_parameters;
+  if (!Array.isArray(params) || params.length === 0) return true;
+  return params.includes("reasoning") || params.includes("include_reasoning");
+}
+
+function selectModel(modelId) {
+  const id = (modelId || "").trim();
+  if (!id) return false;
+
+  const model = allModels.find((m) => m.id === id);
+  if (!model) return false;
+
+  ensureModelOption(model.id, modelLabel(model));
+  modelSelect.value = model.id;
+  modelSearchInput.value = model.id;
+  return true;
+}
+
+function renderModelOptions(query = "") {
+  const q = query.trim().toLowerCase();
+  const selected = modelSelect.value;
+  const filtered = q
+    ? allModels.filter((m) =>
+        m.id.toLowerCase().includes(q) ||
+        (m.name || "").toLowerCase().includes(q) ||
+        (m.description || "").toLowerCase().includes(q)
+      )
+    : allModels;
+
+  const options = filtered.slice(0, 300);
+  modelSelect.innerHTML = "";
+  for (const model of options) {
+    const option = document.createElement("option");
+    option.value = model.id;
+    option.textContent = modelLabel(model);
+    modelSelect.appendChild(option);
+  }
+
+  if (selected && options.some((m) => m.id === selected)) {
+    modelSelect.value = selected;
+    return;
+  }
+  if (options.length > 0) {
+    modelSelect.value = options[0].id;
+  }
+}
+
+function defaultModelId() {
+  return (
+    allModels.find((m) => m.id.startsWith("google/gemini"))?.id ||
+    allModels[0]?.id ||
+    FALLBACK_MODEL
+  );
+}
+
+async function loadModels() {
   try {
-    const res = await fetch("/api/models");
-    if (!res.ok) return;
+    const res = await fetch("/api/models?limit=500");
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
 
-    const providers = data.providers || ["anthropic"];
-    providerSelect.innerHTML = providers
-      .map((p) => `<option value="${p}">${PROVIDER_LABELS[p] || p}</option>`)
-      .join("");
+    allModels = Array.isArray(data.models) ? data.models : [];
+    if (allModels.length === 0) {
+      throw new Error("No OpenRouter models returned");
+    }
 
-    // Hide if only one provider available
-    if (providers.length <= 1) {
-      providerSelect.style.display = "none";
+    renderModelOptions();
+    if (!selectModel(modelSelect.value)) {
+      selectModel(defaultModelId());
     }
   } catch (e) {
-    console.error("Failed to load providers:", e);
-    providerSelect.style.display = "none";
+    console.error("Failed to load models:", e);
+    allModels = [];
+    modelSelect.innerHTML = "";
+    ensureModelOption(FALLBACK_MODEL);
+    modelSelect.value = FALLBACK_MODEL;
+    modelSearchInput.value = FALLBACK_MODEL;
   }
+}
+
+modelSearchInput.addEventListener("input", () => {
+  renderModelOptions(modelSearchInput.value);
+});
+
+modelSearchInput.addEventListener("keydown", (e) => {
+  if (e.key !== "Enter") return;
+  e.preventDefault();
+  const query = modelSearchInput.value.trim();
+  if (!query) return;
+
+  if (!selectModel(query)) {
+    ensureModelOption(query, `Custom: ${query}`);
+    modelSelect.value = query;
+  }
+  triggerAutoSave();
+});
+
+modelSearchInput.addEventListener("blur", () => {
+  if (!modelSelect.value) {
+    selectModel(defaultModelId());
+    return;
+  }
+  modelSearchInput.value = modelSelect.value;
+});
+
+// ── Theme Loading ──
+
+function readSavedThemeId() {
+  try {
+    return localStorage.getItem(THEME_STORAGE_KEY) || LOCAL_THEME_ID;
+  } catch {
+    return LOCAL_THEME_ID;
+  }
+}
+
+function saveThemeId(themeId) {
+  try {
+    localStorage.setItem(THEME_STORAGE_KEY, themeId);
+  } catch {
+    // Ignore storage errors.
+  }
+}
+
+function getThemeLinkEl() {
+  return document.getElementById(THEME_STYLESHEET_ID);
+}
+
+function ensureThemeLinkEl() {
+  let link = getThemeLinkEl();
+  if (link) return link;
+
+  link = document.createElement("link");
+  link.id = THEME_STYLESHEET_ID;
+  link.rel = "stylesheet";
+  document.head.appendChild(link);
+  return link;
+}
+
+function themeExists(themeId) {
+  return allThemes.some((theme) => theme.id === themeId);
+}
+
+function applyTheme(themeId, { persist = true } = {}) {
+  const requested = (themeId || "").trim();
+  const resolved = requested && requested !== LOCAL_THEME_ID && themeExists(requested)
+    ? requested
+    : LOCAL_THEME_ID;
+
+  if (resolved === LOCAL_THEME_ID) {
+    const link = getThemeLinkEl();
+    if (link) link.remove();
+    document.body.classList.remove("obsidian-theme", "theme-dark", "theme-light");
+  } else {
+    const link = ensureThemeLinkEl();
+    link.href = `/api/themes/${encodeURIComponent(resolved)}.css`;
+    document.body.classList.add("obsidian-theme", "theme-dark");
+    document.body.classList.remove("theme-light");
+  }
+
+  themeSelect.value = resolved;
+  if (persist) saveThemeId(resolved);
+}
+
+async function loadThemes() {
+  themeSelect.innerHTML = "";
+  const localOption = document.createElement("option");
+  localOption.value = LOCAL_THEME_ID;
+  localOption.textContent = "Theme: Local";
+  themeSelect.appendChild(localOption);
+
+  try {
+    const res = await fetch("/api/themes?limit=100");
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+
+    allThemes = Array.isArray(data.themes) ? data.themes : [];
+    for (const theme of allThemes) {
+      const option = document.createElement("option");
+      option.value = theme.id;
+      option.textContent = `Theme: ${theme.name}`;
+      themeSelect.appendChild(option);
+    }
+  } catch (error) {
+    allThemes = [];
+    console.error("Failed to load themes:", error);
+  }
+
+  applyTheme(readSavedThemeId(), { persist: false });
 }
 
 // ── Init ──
 
 function init() {
   initSidebar();
-  loadProviders();
+  loadModels();
+  loadThemes();
 }
 
 if (document.readyState === "loading") {
