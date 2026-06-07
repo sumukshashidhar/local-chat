@@ -326,6 +326,7 @@ function createMessageElement(role, content, index, animate = true) {
   } else {
     actionsDiv.innerHTML = `
       <button class="action-btn edit-btn" title="Edit">&#9998;</button>
+      <button class="action-btn continue-btn" title="Continue">&#9656;</button>
       <button class="action-btn retry-btn" title="Retry">&#8635;</button>
     `;
   }
@@ -419,6 +420,8 @@ messagesEl.addEventListener("click", async (e) => {
     triggerAutoSave();
   } else if (btn.classList.contains("edit-btn")) {
     startEdit(messageEl, index, isAssistant);
+  } else if (btn.classList.contains("continue-btn")) {
+    await continueMessage(index);
   } else if (btn.classList.contains("retry-btn")) {
     removeMessagesFrom(index);
     await streamResponse();
@@ -448,20 +451,17 @@ function startEdit(messageEl, index, isAssistant = false) {
   });
 
   let finished = false;
-  const finishEdit = async (save) => {
+  const finishEdit = (save) => {
     if (finished) return;
     finished = true;
 
-    let shouldRegenerate = false;
-
+    // Editing only updates the message in place. It never regenerates or
+    // truncates the rest of the conversation — use Retry to regenerate from
+    // a turn, or Continue to extend an assistant reply.
     if (save) {
       const newContent = textarea.value.trim();
       if (newContent && newContent !== originalContent) {
         state.messages[index].content = newContent;
-        if (!isAssistant) {
-          removeMessagesFrom(index + 1);
-          shouldRegenerate = true;
-        }
       }
     }
 
@@ -476,10 +476,6 @@ function startEdit(messageEl, index, isAssistant = false) {
     messageEl.replaceWith(replacement);
 
     triggerAutoSave();
-
-    if (shouldRegenerate) {
-      await streamResponse();
-    }
   };
 
   textarea.addEventListener("keydown", (e) => {
@@ -508,9 +504,101 @@ function cancelCurrentStream() {
   state.abortController.abort();
 }
 
+// ── Continue & usage meta ──
+
+async function continueMessage(index) {
+  if (state.isStreaming) return;
+  const msg = state.messages[index];
+  if (!msg || msg.role !== "assistant") return;
+  if (index !== state.messages.length - 1) {
+    showToast("Continue works on the latest reply only.", "info", 3000);
+    return;
+  }
+  await streamResponse({ continue: true });
+}
+
+function modelPricing(modelId) {
+  const model = allModels.find((m) => m.id === modelId);
+  if (!model || !model.pricing) return null;
+  const prompt = parseFloat(model.pricing.prompt);
+  const completion = parseFloat(model.pricing.completion);
+  if (!isFinite(prompt) && !isFinite(completion)) return null;
+  return {
+    prompt: isFinite(prompt) ? prompt : 0,
+    completion: isFinite(completion) ? completion : 0,
+  };
+}
+
+function estimateCost(usage, modelId) {
+  const pricing = modelPricing(modelId);
+  if (!pricing) return null;
+  const input = Number(usage.input_tokens) || 0;
+  const output = Number(usage.output_tokens) || 0;
+  const cacheRead = Number(usage.cache_read_input_tokens) || 0;
+  const cacheWrite = Number(usage.cache_creation_input_tokens) || 0;
+  // Estimate: cached reads bill ~0.1x and cache writes ~1.25x the input rate.
+  return (
+    input * pricing.prompt +
+    output * pricing.completion +
+    cacheRead * pricing.prompt * 0.1 +
+    cacheWrite * pricing.prompt * 1.25
+  );
+}
+
+function formatCost(cost) {
+  if (cost == null || !isFinite(cost)) return null;
+  if (cost === 0) return "$0";
+  if (cost < 0.01) return "$" + cost.toFixed(4);
+  if (cost < 1) return "$" + cost.toFixed(3);
+  return "$" + cost.toFixed(2);
+}
+
+function formatDuration(ms) {
+  const n = Number(ms);
+  if (!isFinite(n) || n <= 0) return null;
+  if (n < 1000) return Math.round(n) + "ms";
+  return (n / 1000).toFixed(1) + "s";
+}
+
+function renderUsageMeta(assistantEl, usage, latency, modelId) {
+  if (!assistantEl || !usage) return;
+  const parts = [];
+  const input = Number(usage.input_tokens);
+  const output = Number(usage.output_tokens);
+  const cacheRead = Number(usage.cache_read_input_tokens) || 0;
+  if (isFinite(input)) parts.push(`${input.toLocaleString()} in`);
+  if (isFinite(output)) parts.push(`${output.toLocaleString()} out`);
+  if (cacheRead > 0) parts.push(`${cacheRead.toLocaleString()} cached`);
+
+  const costStr = formatCost(estimateCost(usage, modelId));
+  if (costStr) parts.push(costStr);
+
+  if (latency) {
+    const ttft = formatDuration(latency.time_to_first_token_ms);
+    const total = formatDuration(latency.total_time_ms);
+    if (ttft && total) parts.push(`${ttft} → ${total}`);
+    else if (total) parts.push(total);
+  }
+
+  if (parts.length === 0) return;
+
+  let meta = assistantEl.querySelector(".message-meta");
+  if (!meta) {
+    meta = document.createElement("div");
+    meta.className = "message-meta";
+    const actions = assistantEl.querySelector(".message-actions");
+    if (actions) assistantEl.insertBefore(meta, actions);
+    else assistantEl.appendChild(meta);
+  }
+  meta.textContent = parts.join("  ·  ");
+  meta.title =
+    "Estimated from model pricing · 'cached' = prompt-cache read tokens";
+}
+
 // ── Streaming (rAF-batched) ──
 
-async function streamResponse() {
+async function streamResponse(opts = {}) {
+  const continueMode = opts.continue === true;
   state.isStreaming = true;
   state.abortController = new AbortController();
   setSendButtonMode("stop");
@@ -520,56 +608,81 @@ async function streamResponse() {
 
   clearEmptyState();
 
-  // Create assistant message element
-  const index = state.messages.length;
-  const assistantEl = document.createElement("div");
-  assistantEl.className = "message assistant entering";
-  assistantEl.dataset.index = index;
-  assistantEl.tabIndex = 0;
-
-  // Thinking section
+  let index;
+  let assistantEl;
+  let contentDiv;
   let thinkingSection = null;
   let thinkingContentDiv = null;
-  if (state.thinkingEnabled) {
-    thinkingSection = document.createElement("details");
-    thinkingSection.className = "thinking-section";
-    thinkingSection.open = true;
-    thinkingSection.innerHTML = `
-      <summary>Thinking<span class="thinking-indicator"></span></summary>
-      <div class="thinking-content"></div>
+  let loadingDiv = null;
+  let seedContent = "";
+
+  if (continueMode) {
+    // Continue (assistant prefill): resume the last assistant message in
+    // place. The request already ends with this assistant turn, so the model
+    // extends it rather than starting a new reply.
+    index = state.messages.length - 1;
+    assistantEl =
+      messagesEl.querySelector(`.message.assistant[data-index="${index}"]`) ||
+      messagesEl.querySelector(".message.assistant:last-of-type");
+    seedContent = (state.messages[index] && state.messages[index].content) || "";
+    contentDiv = assistantEl.querySelector(".message-content");
+    assistantEl.classList.add("continuing");
+    const staleMeta = assistantEl.querySelector(".message-meta");
+    if (staleMeta) staleMeta.remove();
+  } else {
+    // Create a fresh assistant message element.
+    index = state.messages.length;
+    assistantEl = document.createElement("div");
+    assistantEl.className = "message assistant entering";
+    assistantEl.dataset.index = index;
+    assistantEl.tabIndex = 0;
+
+    // Thinking section
+    if (state.thinkingEnabled) {
+      thinkingSection = document.createElement("details");
+      thinkingSection.className = "thinking-section";
+      thinkingSection.open = true;
+      thinkingSection.innerHTML = `
+        <summary>Thinking<span class="thinking-indicator"></span></summary>
+        <div class="thinking-content"></div>
+      `;
+      thinkingContentDiv = thinkingSection.querySelector(".thinking-content");
+      assistantEl.appendChild(thinkingSection);
+    }
+
+    // Content container
+    contentDiv = document.createElement("div");
+    contentDiv.className = "message-content";
+    assistantEl.appendChild(contentDiv);
+
+    // Loading indicator
+    loadingDiv = document.createElement("div");
+    loadingDiv.className = "loading-indicator";
+    loadingDiv.innerHTML = "<span></span><span></span><span></span>";
+    contentDiv.appendChild(loadingDiv);
+
+    // Actions (will be usable after streaming)
+    const actionsDiv = document.createElement("div");
+    actionsDiv.className = "message-actions";
+    actionsDiv.innerHTML = `
+      <button class="action-btn edit-btn" title="Edit">&#9998;</button>
+      <button class="action-btn continue-btn" title="Continue">&#9656;</button>
+      <button class="action-btn retry-btn" title="Retry">&#8635;</button>
     `;
-    thinkingContentDiv = thinkingSection.querySelector(".thinking-content");
-    assistantEl.appendChild(thinkingSection);
+    assistantEl.appendChild(actionsDiv);
+
+    messagesEl.appendChild(assistantEl);
   }
 
-  // Content container
-  const contentDiv = document.createElement("div");
-  contentDiv.className = "message-content";
-  assistantEl.appendChild(contentDiv);
-
-  // Loading indicator
-  const loadingDiv = document.createElement("div");
-  loadingDiv.className = "loading-indicator";
-  loadingDiv.innerHTML = "<span></span><span></span><span></span>";
-  contentDiv.appendChild(loadingDiv);
-
-  // Actions (will be usable after streaming)
-  const actionsDiv = document.createElement("div");
-  actionsDiv.className = "message-actions";
-  actionsDiv.innerHTML = `
-    <button class="action-btn edit-btn" title="Edit">&#9998;</button>
-    <button class="action-btn retry-btn" title="Retry">&#8635;</button>
-  `;
-  assistantEl.appendChild(actionsDiv);
-
-  messagesEl.appendChild(assistantEl);
   scrollToBottom(true);
 
-  let fullContent = "";
+  let fullContent = seedContent;
   let fullThinking = "";
   let buffer = "";
   let loadingRemoved = false;
   let streamDone = false;
+  let finalUsage = null;
+  let finalLatency = null;
 
   // rAF batching — at most one DOM update per frame
   let dirty = false;
@@ -588,7 +701,7 @@ async function streamResponse() {
 
     const renderedContent = cleanAssistantContent(fullContent);
 
-    if (!loadingRemoved && (renderedContent || streamDone)) {
+    if (loadingDiv && !loadingRemoved && (renderedContent || streamDone)) {
       loadingDiv.remove();
       loadingRemoved = true;
     }
@@ -612,7 +725,7 @@ async function streamResponse() {
 
     const renderedContent = cleanAssistantContent(fullContent).trim();
 
-    if (!loadingRemoved) {
+    if (loadingDiv && !loadingRemoved) {
       loadingDiv.remove();
       loadingRemoved = true;
     }
@@ -650,7 +763,7 @@ async function streamResponse() {
         system: systemPrompt.value,
         messages: state.messages,
         session_id: state.sessionId,
-        thinking: state.thinkingEnabled && supportsThinking
+        thinking: !continueMode && state.thinkingEnabled && supportsThinking
           ? { enabled: true, budget_tokens: 10000 }
           : undefined,
       }),
@@ -687,6 +800,8 @@ async function streamResponse() {
             scheduleRender();
           } else if (data.type === "done") {
             streamDone = true;
+            finalUsage = data.usage || null;
+            finalLatency = data.latency || null;
             scheduleRender();
 
             if (thinkingSection) {
@@ -696,11 +811,6 @@ async function streamResponse() {
               setTimeout(() => {
                 thinkingSection.open = false;
               }, 400);
-            }
-            if (data.usage?.cache_read_input_tokens) {
-              logDebug("Cache hit", {
-                tokens: data.usage.cache_read_input_tokens,
-              });
             }
           } else if (data.type === "error") {
             throw new Error(data.error);
@@ -726,7 +836,12 @@ async function streamResponse() {
     }
 
     renderFinalContent();
-    state.messages.push({ role: "assistant", content: fullContent });
+    if (continueMode) {
+      state.messages[index].content = fullContent;
+    } else {
+      state.messages.push({ role: "assistant", content: fullContent });
+    }
+    renderUsageMeta(assistantEl, finalUsage, finalLatency, selectedModel);
   } catch (error) {
     const cancelled =
       state.abortController?.signal.aborted ||
@@ -734,7 +849,11 @@ async function streamResponse() {
 
     if (cancelled) {
       const renderedContent = renderFinalContent();
-      if (renderedContent) {
+      if (continueMode) {
+        // Keep the existing reply; commit whatever streamed before cancel.
+        state.messages[index].content = fullContent;
+        assistantEl.classList.add("cancelled");
+      } else if (renderedContent) {
         state.messages.push({ role: "assistant", content: fullContent });
         assistantEl.classList.add("cancelled");
       } else {
@@ -742,6 +861,17 @@ async function streamResponse() {
         if (state.messages.length === 0) showEmptyState();
       }
       showToast("Response cancelled", "info", 2000);
+    } else if (continueMode) {
+      // Continuation failed (e.g. the model rejects assistant prefill).
+      // Restore the original reply untouched and surface the error.
+      state.messages[index].content = seedContent;
+      contentDiv.innerHTML = formatContent(cleanAssistantContent(seedContent).trim());
+      logError("Failed to continue response", error);
+      showToast(
+        errorMessage(error, "This model can't continue an assistant message"),
+        "error",
+        5000,
+      );
     } else {
       // Remove dangling assistant element (no backing state entry)
       assistantEl.remove();
@@ -755,7 +885,7 @@ async function streamResponse() {
       dirty = false;
     }
 
-    assistantEl.classList.remove("entering");
+    assistantEl.classList.remove("entering", "continuing");
     state.isStreaming = false;
     state.abortController = null;
     setSendButtonMode("send");
@@ -1494,8 +1624,12 @@ function applyTheme(themeId, { persist = true } = {}) {
   } else {
     const link = ensureThemeLinkEl();
     link.href = `/api/themes/${encodeURIComponent(resolved)}.css`;
-    document.body.classList.add("obsidian-theme", "theme-dark");
-    document.body.classList.remove("theme-light");
+    const prefersDark =
+      window.matchMedia &&
+      window.matchMedia("(prefers-color-scheme: dark)").matches;
+    document.body.classList.add("obsidian-theme");
+    document.body.classList.toggle("theme-dark", prefersDark);
+    document.body.classList.toggle("theme-light", !prefersDark);
   }
 
   themeSelect.value = resolved;

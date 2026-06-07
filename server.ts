@@ -1344,7 +1344,7 @@ async function handleStream(req: Request, ctx: RequestContext): Promise<Response
           thinking_chars: fullThinking.length || undefined,
         });
 
-        enqueue({ type: "done", usage });
+        enqueue({ type: "done", usage, latency });
       } catch (error) {
         const cancelled = clientCancelled || isAbortLikeError(error);
         const msg = cancelled
@@ -1704,6 +1704,13 @@ const MIME: Record<string, string> = {
   ".html": "text/html",
   ".css": "text/css",
   ".js": "application/javascript",
+  ".json": "application/json",
+  ".woff2": "font/woff2",
+  ".woff": "font/woff",
+  ".ttf": "font/ttf",
+  ".svg": "image/svg+xml",
+  ".png": "image/png",
+  ".ico": "image/x-icon",
 };
 
 const STATIC_CACHE = "no-cache";

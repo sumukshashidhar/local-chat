@@ -310,6 +310,7 @@ describe("Chat API", () => {
     const decoder = new TextDecoder();
     let buffer = "";
     const eventTypes: string[] = [];
+    let doneEvent: Record<string, any> | null = null;
 
     if (reader) {
       while (true) {
@@ -328,12 +329,23 @@ describe("Chat API", () => {
           if (!payload) continue;
           const data = JSON.parse(payload);
           eventTypes.push(data.type);
+          if (data.type === "done") doneEvent = data;
         }
       }
     }
 
     expect(eventTypes).toContain("delta");
     expect(eventTypes).toContain("done");
+
+    // The done event carries usage (incl. cached tokens) and latency so the
+    // client can render the per-message cost/usage readout.
+    expect(doneEvent).toBeTruthy();
+    expect(doneEvent?.usage.input_tokens).toBe(12);
+    expect(doneEvent?.usage.output_tokens).toBe(1);
+    expect(doneEvent?.usage.cache_read_input_tokens).toBe(4);
+    expect(typeof doneEvent?.latency?.total_time_ms).toBe("number");
+    expect(doneEvent?.latency?.total_time_ms).toBeGreaterThanOrEqual(0);
+    expect(typeof doneEvent?.latency?.time_to_first_token_ms).toBe("number");
 
     if (testLogsDir) {
       const logText = await readFile(join(testLogsDir, "chat_logs.jsonl"), "utf8");
@@ -359,6 +371,53 @@ describe("Chat API", () => {
     expect(generationEvent?.body.output).toBe("OK");
     expect((generationEvent?.body.usageDetails as Record<string, number>).input).toBe(12);
     expect((generationEvent?.body.usageDetails as Record<string, number>).output).toBe(1);
+  });
+
+  test("POST /api/chat accepts a conversation ending with an assistant turn (continuation)", async () => {
+    const model = await getAnyModel();
+    const res = await fetch(`${BASE_URL}/api/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model,
+        system: "You are a helpful assistant.",
+        // Conversation ends on an assistant turn — the prefill the model
+        // should continue. The server must not reject this.
+        messages: [
+          { role: "user", content: "Write a numbered list." },
+          { role: "assistant", content: "Here is the list:\n1." },
+        ],
+        session_id: "test-continue-1",
+      }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toBe("text/event-stream");
+
+    const reader = res.body?.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    const eventTypes: string[] = [];
+    if (reader) {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const events = buffer.split("\n\n");
+        buffer = events.pop() || "";
+        for (const event of events) {
+          const payload = event
+            .split("\n")
+            .find((line) => line.startsWith("data: "))
+            ?.slice(6);
+          if (!payload) continue;
+          eventTypes.push(JSON.parse(payload).type);
+        }
+      }
+    }
+
+    expect(eventTypes).toContain("delta");
+    expect(eventTypes).toContain("done");
   });
 
   test("POST /api/chat records cancellation when the client aborts mid-stream", async () => {
