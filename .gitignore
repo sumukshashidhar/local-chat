@@ -213,3 +213,12 @@ bun.lockb
 
 # Chat logs
 logs/
+
+# macOS
+.DS_Store
+
+# Claude Code local config
+.claude/
+
+# Self-hosted proprietary fonts (OpenAI Sans) — not licensed for redistribution
+public/fonts/

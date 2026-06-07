@@ -369,7 +369,7 @@ main {
 
 /* Role labels */
 .message::before {
-  content: 'Claude';
+  content: 'Assistant';
   display: block;
   font-size: 11px;
   font-weight: 600;
@@ -442,6 +442,7 @@ main {
 
 .delete-btn:hover { color: var(--danger); border-color: var(--danger); }
 .retry-btn:hover  { color: var(--accent); border-color: var(--accent); }
+.duplicate-btn:hover { color: var(--success); border-color: var(--success); }
 
 /* ── Edit Mode ───────────────────────────────────────────────────────────── */
 
@@ -597,62 +598,6 @@ main {
   background: var(--text-dim);
 }
 
-/* ── Analysis Section ────────────────────────────────────────────────────── */
-
-.analysis-section {
-  margin-bottom: 14px;
-  border: 1px solid var(--border-solid);
-  border-radius: var(--radius-sm);
-  overflow: hidden;
-}
-
-.analysis-section summary {
-  padding: 8px 12px;
-  background: var(--surface);
-  cursor: pointer;
-  font-size: 12px;
-  font-weight: 500;
-  color: var(--text-dim);
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  user-select: none;
-  transition: background var(--fast), color var(--fast);
-}
-
-.analysis-section summary:hover {
-  background: var(--surface-hover);
-  color: var(--text-secondary);
-}
-
-.analysis-section[open] summary {
-  border-bottom: 1px solid var(--border-solid);
-}
-
-.analysis-content {
-  padding: 12px 14px;
-  font-size: 13px;
-  line-height: 1.6;
-  color: var(--text-secondary);
-  background: rgba(200, 164, 78, 0.08);
-  max-height: 300px;
-  overflow-y: auto;
-  font-family: var(--font-mono);
-}
-
-.analysis-indicator {
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: var(--accent-dim);
-  animation: pulse 1.2s ease-in-out infinite;
-}
-
-.analysis-indicator.done {
-  animation: none;
-  background: var(--text-dim);
-}
-
 /* ── Loading Dots ────────────────────────────────────────────────────────── */
 
 .loading-indicator {
@@ -746,6 +691,16 @@ footer {
 
 #send-btn:active {
   transform: translateY(0) scale(0.96);
+  box-shadow: none;
+}
+
+#send-btn.streaming {
+  background: var(--danger);
+  color: var(--text);
+}
+
+#send-btn.streaming:hover {
+  background: var(--danger-hover);
   box-shadow: none;
 }
 

@@ -5,10 +5,12 @@
   "scripts": {
     "start": "bun run server.ts",
     "dev": "bun --watch run server.ts",
+    "typecheck": "tsc --noEmit",
     "test": "bun test"
   },
   "dependencies": {},
   "devDependencies": {
-    "@types/bun": "^1.1.0"
+    "@types/bun": "^1.1.0",
+    "typescript": "^5.9.3"
   }
 }

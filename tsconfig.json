@@ -10,6 +10,7 @@
     "allowSyntheticDefaultImports": true,
     "resolveJsonModule": true,
     "isolatedModules": true,
+    "types": ["bun"],
     "lib": ["ESNext", "DOM"]
   },
   "include": ["*.ts", "**/*.ts"],

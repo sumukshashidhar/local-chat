@@ -4,12 +4,53 @@ function generateSessionId() {
   return Date.now().toString(36) + Math.random().toString(36).slice(2, 9);
 }
 
+function debugLoggingEnabled() {
+  try {
+    return (
+      localStorage.getItem("local-chat-debug") === "1" ||
+      new URLSearchParams(window.location.search).has("debug")
+    );
+  } catch {
+    return false;
+  }
+}
+
+const DEBUG_LOGS = debugLoggingEnabled();
+
+function logDebug(message, details) {
+  if (!DEBUG_LOGS) return;
+  console.debug("[local-chat]", message, details || "");
+}
+
+function logError(message, error) {
+  console.error(`[local-chat] ${message}`, error);
+}
+
+function errorMessage(error, fallback = "Something went wrong") {
+  return error instanceof Error && error.message ? error.message : fallback;
+}
+
+async function readResponseError(response) {
+  const text = await response.text();
+  if (!text) return `HTTP ${response.status}`;
+
+  try {
+    const data = JSON.parse(text);
+    if (data && typeof data.error === "string") return data.error;
+  } catch {
+    // Fall back to raw text below.
+  }
+
+  return text;
+}
+
 // ── State ──
 
 const state = {
   sessionId: generateSessionId(),
   messages: [],
   isStreaming: false,
+  abortController: null,
   thinkingEnabled: false,
   currentChatId: null,
   isDirty: false,
@@ -34,6 +75,8 @@ const thinkingToggle = $("#thinking-toggle");
 const clearBtn = $("#clear-btn");
 const overlay = $(".sidebar-overlay");
 const toastsEl = $("#toasts");
+const SEND_ICON = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M12 19V5M5 12l7-7 7 7" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+const STOP_ICON = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none"><rect x="7" y="7" width="10" height="10" rx="1.5" fill="currentColor"/></svg>';
 let allModels = [];
 let allThemes = [];
 let unsupportedThinkingModelWarned = "";
@@ -49,10 +92,6 @@ const AppDialog = (() => {
   const cancelBtn = dialog.querySelector(".dialog-cancel");
   const confirmBtn = dialog.querySelector(".dialog-confirm");
   let resolvePromise = null;
-
-  function cleanup() {
-    resolvePromise = null;
-  }
 
   cancelBtn.addEventListener("click", () => {
     const resolve = resolvePromise;
@@ -139,6 +178,27 @@ function escapeHtml(text) {
   return div.innerHTML;
 }
 
+function escapeAttribute(text) {
+  return String(text)
+    .replace(/&/g, "&amp;")
+    .replace(/"/g, "&quot;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+function safeHref(href) {
+  try {
+    const url = new URL(href, window.location.origin);
+    if (url.protocol === "http:" || url.protocol === "https:" || url.protocol === "mailto:") {
+      return href;
+    }
+  } catch {
+    // Invalid links are rendered inert.
+  }
+
+  return "#";
+}
+
 function formatContent(text) {
   if (!text) return "";
 
@@ -185,7 +245,8 @@ function formatContent(text) {
   // Links
   s = s.replace(
     /\[([^\]]+)\]\(([^)]+)\)/g,
-    '<a href="$2" target="_blank" rel="noopener">$1</a>'
+    (_match, label, href) =>
+      `<a href="${escapeAttribute(safeHref(href))}" target="_blank" rel="noopener">${label}</a>`
   );
 
   // Horizontal rule
@@ -213,73 +274,9 @@ function formatContent(text) {
   return s;
 }
 
-function stripResponseTags(text) {
+function cleanAssistantContent(text) {
+  if (typeof text !== "string") return "";
   return text.replace(/<\/?response>/gi, "");
-}
-
-function findResponseBoundary(text) {
-  let boundary = null;
-
-  const closeTag = /<\/response>/i.exec(text);
-  if (closeTag) {
-    boundary = {
-      start: closeTag.index,
-      end: closeTag.index + closeTag[0].length,
-    };
-  }
-
-  const responseHeading = /(^|\n)###\s*Response\b[^\n]*/.exec(text);
-  if (responseHeading) {
-    const prefixLen = responseHeading[1] ? responseHeading[1].length : 0;
-    const start = responseHeading.index + prefixLen;
-    let end = start + responseHeading[0].length - prefixLen;
-
-    if (text[end] === "\r" && text[end + 1] === "\n") {
-      end += 2;
-    } else if (text[end] === "\n") {
-      end += 1;
-    }
-
-    if (!boundary || start < boundary.start) {
-      boundary = { start, end };
-    }
-  }
-
-  return boundary;
-}
-
-function splitAssistantContent(rawText, { final = true } = {}) {
-  const text = typeof rawText === "string" ? rawText : "";
-  const boundary = findResponseBoundary(text);
-
-  if (!boundary) {
-    const cleaned = stripResponseTags(text).trim();
-    if (final) {
-      return { analysisText: "", responseText: cleaned };
-    }
-    return { analysisText: cleaned, responseText: "" };
-  }
-
-  return {
-    analysisText: stripResponseTags(text.slice(0, boundary.start)).trim(),
-    responseText: stripResponseTags(text.slice(boundary.end)).trim(),
-  };
-}
-
-function createAnalysisSection() {
-  const section = document.createElement("details");
-  section.className = "analysis-section";
-  section.open = true;
-  section.innerHTML = `
-    <summary>Analysis<span class="analysis-indicator"></span></summary>
-    <div class="analysis-content"></div>
-  `;
-
-  return {
-    section,
-    content: section.querySelector(".analysis-content"),
-    indicator: section.querySelector(".analysis-indicator"),
-  };
 }
 
 // ── Scroll Management ──
@@ -311,16 +308,7 @@ function createMessageElement(role, content, index, animate = true) {
   contentDiv.className = "message-content";
 
   if (role === "assistant") {
-    const parsed = splitAssistantContent(content, { final: true });
-    const analysisUI = createAnalysisSection();
-
-    if (parsed.analysisText) {
-      analysisUI.content.innerHTML = formatContent(parsed.analysisText);
-      analysisUI.indicator.classList.add("done");
-      div.appendChild(analysisUI.section);
-    }
-
-    contentDiv.innerHTML = formatContent(parsed.responseText);
+    contentDiv.innerHTML = formatContent(cleanAssistantContent(content).trim());
   } else {
     contentDiv.innerHTML = formatContent(content);
   }
@@ -506,11 +494,26 @@ function startEdit(messageEl, index, isAssistant = false) {
   textarea.addEventListener("blur", () => finishEdit(true));
 }
 
+function setSendButtonMode(mode) {
+  const stopping = mode === "stop";
+  sendBtn.classList.toggle("streaming", stopping);
+  sendBtn.disabled = false;
+  sendBtn.title = stopping ? "Stop generating" : "Send";
+  sendBtn.setAttribute("aria-label", stopping ? "Stop generating" : "Send");
+  sendBtn.innerHTML = stopping ? STOP_ICON : SEND_ICON;
+}
+
+function cancelCurrentStream() {
+  if (!state.isStreaming || !state.abortController) return;
+  state.abortController.abort();
+}
+
 // ── Streaming (rAF-batched) ──
 
 async function streamResponse() {
   state.isStreaming = true;
-  sendBtn.disabled = true;
+  state.abortController = new AbortController();
+  setSendButtonMode("stop");
 
   // Remember scroll position intent
   shouldAutoScroll = true;
@@ -538,10 +541,6 @@ async function streamResponse() {
     thinkingContentDiv = thinkingSection.querySelector(".thinking-content");
     assistantEl.appendChild(thinkingSection);
   }
-
-  const analysisUI = createAnalysisSection();
-  analysisUI.section.style.display = "none";
-  assistantEl.appendChild(analysisUI.section);
 
   // Content container
   const contentDiv = document.createElement("div");
@@ -587,26 +586,14 @@ async function streamResponse() {
     if (!dirty) return;
     dirty = false;
 
-    const parsed = splitAssistantContent(fullContent, { final: streamDone });
+    const renderedContent = cleanAssistantContent(fullContent);
 
-    if (!loadingRemoved && (parsed.analysisText || parsed.responseText)) {
+    if (!loadingRemoved && (renderedContent || streamDone)) {
       loadingDiv.remove();
       loadingRemoved = true;
     }
 
-    contentDiv.innerHTML = formatContent(parsed.responseText);
-
-    if (parsed.analysisText) {
-      analysisUI.section.style.display = "";
-      analysisUI.content.innerHTML = formatContent(parsed.analysisText);
-    } else {
-      analysisUI.section.style.display = "none";
-      analysisUI.content.innerHTML = "";
-    }
-
-    if (analysisUI.indicator) {
-      analysisUI.indicator.classList.toggle("done", streamDone);
-    }
+    contentDiv.innerHTML = formatContent(renderedContent);
 
     if (thinkingContentDiv && fullThinking) {
       thinkingContentDiv.innerHTML = formatContent(fullThinking);
@@ -615,6 +602,28 @@ async function streamResponse() {
     if (shouldAutoScroll) {
       messagesEl.scrollTop = messagesEl.scrollHeight;
     }
+  }
+
+  function renderFinalContent() {
+    if (rafId) {
+      cancelAnimationFrame(rafId);
+      rafId = null;
+    }
+
+    const renderedContent = cleanAssistantContent(fullContent).trim();
+
+    if (!loadingRemoved) {
+      loadingDiv.remove();
+      loadingRemoved = true;
+    }
+
+    contentDiv.innerHTML = formatContent(renderedContent);
+
+    if (thinkingContentDiv && fullThinking) {
+      thinkingContentDiv.innerHTML = formatContent(fullThinking);
+    }
+
+    return renderedContent;
   }
 
   try {
@@ -635,6 +644,7 @@ async function streamResponse() {
     const response = await fetch("/api/chat", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
+      signal: state.abortController.signal,
       body: JSON.stringify({
         model: selectedModel,
         system: systemPrompt.value,
@@ -647,7 +657,7 @@ async function streamResponse() {
     });
 
     if (!response.ok) {
-      throw new Error((await response.text()) || `HTTP ${response.status}`);
+      throw new Error(await readResponseError(response));
     }
 
     if (!response.body) throw new Error("No response body");
@@ -688,17 +698,15 @@ async function streamResponse() {
               }, 400);
             }
             if (data.usage?.cache_read_input_tokens) {
-              console.log(
-                "Cache hit:",
-                data.usage.cache_read_input_tokens,
-                "tokens"
-              );
+              logDebug("Cache hit", {
+                tokens: data.usage.cache_read_input_tokens,
+              });
             }
           } else if (data.type === "error") {
             throw new Error(data.error);
           }
         } catch (e) {
-          if (e.message && !e.message.includes("JSON")) throw e;
+          if (e instanceof Error && !e.message.includes("JSON")) throw e;
         }
       }
     }
@@ -717,46 +725,30 @@ async function streamResponse() {
       }
     }
 
-    // Final render — cancel any pending rAF and flush immediately
-    if (rafId) {
-      cancelAnimationFrame(rafId);
-      rafId = null;
-    }
-
-    const parsedFinal = splitAssistantContent(fullContent, { final: true });
-
-    if (!loadingRemoved && (parsedFinal.analysisText || parsedFinal.responseText)) {
-      loadingDiv.remove();
-      loadingRemoved = true;
-    }
-
-    contentDiv.innerHTML = formatContent(parsedFinal.responseText);
-
-    if (parsedFinal.analysisText) {
-      analysisUI.section.style.display = "";
-      analysisUI.content.innerHTML = formatContent(parsedFinal.analysisText);
-      if (analysisUI.indicator) {
-        analysisUI.indicator.classList.add("done");
-      }
-    } else {
-      analysisUI.section.style.display = "none";
-      analysisUI.content.innerHTML = "";
-    }
-
-    if (thinkingContentDiv && fullThinking) {
-      thinkingContentDiv.innerHTML = formatContent(fullThinking);
-    }
-
+    renderFinalContent();
     state.messages.push({ role: "assistant", content: fullContent });
   } catch (error) {
-    // Remove dangling assistant element (no backing state entry)
-    assistantEl.remove();
-    if (state.messages.length === 0) showEmptyState();
-    showToast(
-      error instanceof Error ? error.message : "Failed to get response",
-      "error",
-      5000
-    );
+    const cancelled =
+      state.abortController?.signal.aborted ||
+      (error instanceof Error && error.name === "AbortError");
+
+    if (cancelled) {
+      const renderedContent = renderFinalContent();
+      if (renderedContent) {
+        state.messages.push({ role: "assistant", content: fullContent });
+        assistantEl.classList.add("cancelled");
+      } else {
+        assistantEl.remove();
+        if (state.messages.length === 0) showEmptyState();
+      }
+      showToast("Response cancelled", "info", 2000);
+    } else {
+      // Remove dangling assistant element (no backing state entry)
+      assistantEl.remove();
+      if (state.messages.length === 0) showEmptyState();
+      logError("Failed to get response", error);
+      showToast(errorMessage(error, "Failed to get response"), "error", 5000);
+    }
   } finally {
     if (rafId) {
       cancelAnimationFrame(rafId);
@@ -765,7 +757,8 @@ async function streamResponse() {
 
     assistantEl.classList.remove("entering");
     state.isStreaming = false;
-    sendBtn.disabled = false;
+    state.abortController = null;
+    setSendButtonMode("send");
     input.focus();
 
     triggerAutoSave({ immediate: true });
@@ -844,7 +837,7 @@ async function saveCurrentChat() {
       }
     }
   } catch (e) {
-    console.error("Failed to save chat:", e);
+    logError("Failed to save chat", e);
   } finally {
     isSaving = false;
     if (saveQueued) {
@@ -912,7 +905,7 @@ async function loadChat(chatId) {
       closeSidebar();
     }
   } catch (e) {
-    console.error("Failed to load chat:", e);
+    logError("Failed to load chat", e);
     showToast("Failed to load chat", "error");
   }
 }
@@ -946,7 +939,7 @@ async function loadChatList() {
     state.savedChats = data.chats || [];
     renderChatList();
   } catch (e) {
-    console.error("Failed to load chat list:", e);
+    logError("Failed to load chat list", e);
   }
 }
 
@@ -969,6 +962,9 @@ function renderChatList() {
         <span class="chat-date">${formatDate(chat.updatedAt)}</span>
       </div>
       <div class="chat-item-actions">
+        <button class="action-btn duplicate-btn" title="Duplicate">
+          <svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true"><rect x="5" y="3" width="8" height="10" rx="1.4" stroke="currentColor" stroke-width="1.3"/><path d="M3 11V5.5C3 4.7 3.7 4 4.5 4H10" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>
+        </button>
         <button class="action-btn rename-btn" title="Rename">&#9998;</button>
         <button class="action-btn delete-btn" title="Delete">&times;</button>
       </div>
@@ -1006,6 +1002,9 @@ function updateChatInList(chatData) {
           <span class="chat-date">${formatDate(chatData.updatedAt)}</span>
         </div>
         <div class="chat-item-actions">
+          <button class="action-btn duplicate-btn" title="Duplicate">
+            <svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true"><rect x="5" y="3" width="8" height="10" rx="1.4" stroke="currentColor" stroke-width="1.3"/><path d="M3 11V5.5C3 4.7 3.7 4 4.5 4H10" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>
+          </button>
           <button class="action-btn rename-btn" title="Rename">&#9998;</button>
           <button class="action-btn delete-btn" title="Delete">&times;</button>
         </div>
@@ -1071,8 +1070,34 @@ async function renameChat(chatId, newTitle) {
       if (chat) chat.title = newTitle;
     }
   } catch (e) {
-    console.error("Failed to rename chat:", e);
+    logError("Failed to rename chat", e);
     showToast("Failed to rename chat", "error");
+  }
+}
+
+async function duplicateChat(chatId) {
+  if (state.isStreaming) return;
+
+  if (chatId === state.currentChatId && state.isDirty && state.messages.length > 0) {
+    await saveCurrentChat();
+  }
+
+  try {
+    const res = await fetch(`/api/chats/${chatId}/duplicate`, { method: "POST" });
+    if (!res.ok) throw new Error(await readResponseError(res));
+
+    const duplicate = await res.json();
+    updateChatInList({
+      id: duplicate.id,
+      title: duplicate.title,
+      updatedAt: duplicate.updatedAt,
+      createdAt: duplicate.createdAt,
+    });
+    await loadChat(duplicate.id);
+    showToast("Chat duplicated", "success");
+  } catch (e) {
+    logError("Failed to duplicate chat", e);
+    showToast("Failed to duplicate chat", "error");
   }
 }
 
@@ -1148,7 +1173,7 @@ async function deleteChat(chatId) {
       showToast("Chat deleted", "success");
     }
   } catch (e) {
-    console.error("Failed to delete chat:", e);
+    logError("Failed to delete chat", e);
     showToast("Failed to delete chat", "error");
   }
 }
@@ -1195,6 +1220,9 @@ function initSidebar() {
     if (e.target.closest(".delete-btn")) {
       e.stopPropagation();
       await deleteChat(chatId);
+    } else if (e.target.closest(".duplicate-btn")) {
+      e.stopPropagation();
+      await duplicateChat(chatId);
     } else if (e.target.closest(".rename-btn")) {
       e.stopPropagation();
       const titleEl = item.querySelector(".chat-title");
@@ -1257,6 +1285,12 @@ systemPrompt.addEventListener("input", () => triggerAutoSave());
 input.addEventListener("input", () => {
   input.style.height = "auto";
   input.style.height = Math.min(input.scrollHeight, 200) + "px";
+});
+
+sendBtn.addEventListener("click", (e) => {
+  if (!state.isStreaming) return;
+  e.preventDefault();
+  cancelCurrentStream();
 });
 
 // Form submit
@@ -1376,7 +1410,7 @@ async function loadModels() {
       selectModel(defaultModelId());
     }
   } catch (e) {
-    console.error("Failed to load models:", e);
+    logError("Failed to load models", e);
     allModels = [];
     modelSelect.innerHTML = "";
     ensureModelOption(FALLBACK_MODEL);
@@ -1489,7 +1523,7 @@ async function loadThemes() {
     }
   } catch (error) {
     allThemes = [];
-    console.error("Failed to load themes:", error);
+    logError("Failed to load themes", error);
   }
 
   applyTheme(readSavedThemeId(), { persist: false });

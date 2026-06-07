@@ -1,29 +1,191 @@
+import { existsSync, readFileSync } from "node:fs";
 import { appendFile, mkdir, readdir, rename, unlink, writeFile } from "node:fs/promises";
-import { dirname } from "node:path";
+import { dirname, extname, resolve, sep } from "node:path";
 
 // ── Config ──────────────────────────────────────────────────────────────────
 
-const PORT = Number.parseInt(process.env.PORT || "3000", 10) || 3000;
-const LOGS_DIR = "./logs";
+function trimInlineEnvComment(value: string): string {
+  let quote: string | null = null;
+  let escaped = false;
+
+  for (let i = 0; i < value.length; i++) {
+    const char = value[i];
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (char === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (quote) {
+      if (char === quote) quote = null;
+      continue;
+    }
+    if (char === "\"" || char === "'") {
+      quote = char;
+      continue;
+    }
+    if (char === "#" && (i === 0 || /\s/.test(value[i - 1]))) {
+      return value.slice(0, i).trimEnd();
+    }
+  }
+
+  return value.trimEnd();
+}
+
+function parseEnvValue(rawValue: string): string {
+  const trimmed = trimInlineEnvComment(rawValue).trim();
+  const quote = trimmed[0];
+  if (
+    (quote === "\"" || quote === "'") &&
+    trimmed.length >= 2 &&
+    trimmed[trimmed.length - 1] === quote
+  ) {
+    const inner = trimmed.slice(1, -1);
+    if (quote === "\"") {
+      return inner
+        .replace(/\\n/g, "\n")
+        .replace(/\\r/g, "\r")
+        .replace(/\\t/g, "\t")
+        .replace(/\\"/g, "\"")
+        .replace(/\\\\/g, "\\");
+    }
+    return inner;
+  }
+  return trimmed;
+}
+
+function loadDotEnv(envPath = resolve(".env")): void {
+  if (!existsSync(envPath)) return;
+
+  const content = readFileSync(envPath, "utf8");
+  for (const rawLine of content.split(/\r?\n/)) {
+    let line = rawLine.trim();
+    if (!line || line.startsWith("#")) continue;
+    if (line.startsWith("export ")) line = line.slice(7).trim();
+
+    const separator = line.indexOf("=");
+    if (separator <= 0) continue;
+
+    const key = line.slice(0, separator).trim();
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue;
+
+    process.env[key] = parseEnvValue(line.slice(separator + 1));
+  }
+}
+
+loadDotEnv();
+
+function parsePort(raw: string | undefined): number {
+  const parsed = Number.parseInt(raw || "3000", 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 3000;
+}
+
+const PORT = parsePort(process.env.PORT);
+const LOGS_DIR = process.env.LOGS_DIR || "./logs";
 const CHATS_DIR = `${LOGS_DIR}/chats`;
 const CHAT_LOGS_JSONL = `${LOGS_DIR}/chat_logs.jsonl`;
 const MODEL_CACHE_JSON = `${LOGS_DIR}/openrouter_models_cache.json`;
 const PROMPT_CACHE_TTL = "1h" as const;
 const DEFAULT_MODEL = process.env.OPENROUTER_DEFAULT_MODEL || "google/gemini-2.0-flash-001";
 const OPENROUTER_PROVIDER = "openrouter" as const;
-const OPENROUTER_API_BASE = "https://openrouter.ai/api/v1";
+const OPENROUTER_API_BASE = (process.env.OPENROUTER_API_BASE || "https://openrouter.ai/api/v1").replace(/\/+$/, "");
 const OPENROUTER_CHAT_URL = `${OPENROUTER_API_BASE}/chat/completions`;
 const OPENROUTER_MODELS_URL = `${OPENROUTER_API_BASE}/models`;
+const LANGFUSE_PUBLIC_KEY = process.env.LANGFUSE_PUBLIC_KEY || "";
+const LANGFUSE_SECRET_KEY = process.env.LANGFUSE_SECRET_KEY || "";
+const LANGFUSE_BASE_URL = (process.env.LANGFUSE_BASE_URL || "https://cloud.langfuse.com").replace(/\/+$/, "");
+const LANGFUSE_REQUEST_TIMEOUT_MS = 4_000;
 const MODEL_CACHE_TTL_MS = 5 * 60 * 1000;
 const THEME_CACHE_TTL_MS = 60 * 1000;
 const DEFAULT_OBSIDIAN_THEMES_DIR = "/Users/sumukshashidhar/Documents/root/resources/reflection/.obsidian/themes";
 const OBSIDIAN_THEMES_DIR = process.env.OBSIDIAN_THEMES_DIR || DEFAULT_OBSIDIAN_THEMES_DIR;
 const CHAT_ID_RE = /^[a-zA-Z0-9-]+$/;
 const THEME_ID_RE = /^[a-z0-9-]+$/;
+const PUBLIC_DIR = resolve("./public");
+
+type LogLevel = "debug" | "info" | "warn" | "error";
+type ConfiguredLogLevel = LogLevel | "silent";
+type LogContext = Record<string, unknown>;
+
+const LOG_LEVELS: Record<ConfiguredLogLevel, number> = {
+  debug: 10,
+  info: 20,
+  warn: 30,
+  error: 40,
+  silent: 50,
+};
+
+function parseLogLevel(value: string | undefined): ConfiguredLogLevel {
+  if (value === "debug" || value === "info" || value === "warn" || value === "error" || value === "silent") {
+    return value;
+  }
+  return "info";
+}
+
+const LOG_LEVEL = parseLogLevel(process.env.LOG_LEVEL);
+
+function parseEnabled(value: string | undefined, defaultValue: boolean): boolean {
+  if (value === undefined) return defaultValue;
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "0" || normalized === "false" || normalized === "no" || normalized === "off") {
+    return false;
+  }
+  if (normalized === "1" || normalized === "true" || normalized === "yes" || normalized === "on") {
+    return true;
+  }
+  return defaultValue;
+}
+
+const LANGFUSE_ENABLED = parseEnabled(process.env.LANGFUSE_ENABLED, true);
+
+function errorDetails(error: unknown): LogContext {
+  if (error instanceof Error) {
+    return {
+      name: error.name,
+      message: error.message,
+      ...(LOG_LEVEL === "debug" && error.stack ? { stack: error.stack } : {}),
+    };
+  }
+  return { message: String(error) };
+}
+
+function cleanContext(context: LogContext): LogContext {
+  return Object.fromEntries(
+    Object.entries(context).filter(([, value]) => value !== undefined),
+  );
+}
+
+function writeLog(level: LogLevel, event: string, context: LogContext = {}): void {
+  if (LOG_LEVELS[level] < LOG_LEVELS[LOG_LEVEL]) return;
+
+  const record = {
+    timestamp: new Date().toISOString(),
+    level,
+    event,
+    ...cleanContext(context),
+  };
+  const line = JSON.stringify(record);
+  if (level === "warn" || level === "error") {
+    console.error(line);
+  } else {
+    console.log(line);
+  }
+}
+
+const logger = {
+  debug: (event: string, context?: LogContext) => writeLog("debug", event, context),
+  info: (event: string, context?: LogContext) => writeLog("info", event, context),
+  warn: (event: string, context?: LogContext) => writeLog("warn", event, context),
+  error: (event: string, context?: LogContext) => writeLog("error", event, context),
+};
 
 const openRouterApiKey = process.env.OPENROUTER_API_KEY;
 if (!openRouterApiKey) {
-  console.error("No API key configured. Set OPENROUTER_API_KEY.");
+  logger.error("startup.missing_openrouter_api_key", {
+    message: "Set OPENROUTER_API_KEY before starting the server.",
+  });
   process.exit(1);
 }
 
@@ -31,7 +193,7 @@ function openRouterHeaders(): HeadersInit {
   return {
     Authorization: `Bearer ${openRouterApiKey}`,
     "Content-Type": "application/json",
-    "HTTP-Referer": "http://localhost:3000",
+    "HTTP-Referer": `http://localhost:${PORT}`,
     "X-Title": "Local Chat",
   };
 }
@@ -63,9 +225,13 @@ interface SavedChat {
 
 interface ChatLog {
   id: string;
+  request_id: string;
+  status: "completed" | "failed" | "cancelled";
   session_id: string;
   timestamp: string;
+  provider: string;
   model: string;
+  requested_model?: string;
   system_prompt: string;
   messages: Message[];
   response: string;
@@ -84,6 +250,15 @@ interface ChatLog {
   thinking_enabled?: boolean;
   thinking_budget?: number;
   error?: string;
+}
+
+interface LangfuseInferenceEvent {
+  log: ChatLog;
+  startTime: Date;
+  endTime: Date;
+  completionStartTime?: Date;
+  requestedModel: string;
+  modelParameters: Record<string, unknown>;
 }
 
 interface ModelCatalogEntry {
@@ -110,6 +285,171 @@ let modelCatalogCache:
 let themeCatalogCache:
   | { fetchedAt: string; expiresAt: number; enabled: boolean; themes: ThemeCatalogEntry[] }
   | null = null;
+
+// ── LangFuse ───────────────────────────────────────────────────────────────
+
+function langfuseConfigured(): boolean {
+  return LANGFUSE_ENABLED && Boolean(LANGFUSE_PUBLIC_KEY && LANGFUSE_SECRET_KEY);
+}
+
+function langfuseIngestionUrl(): string {
+  if (LANGFUSE_BASE_URL.endsWith("/api/public/ingestion")) return LANGFUSE_BASE_URL;
+  if (LANGFUSE_BASE_URL.endsWith("/api/public")) return `${LANGFUSE_BASE_URL}/ingestion`;
+  return `${LANGFUSE_BASE_URL}/api/public/ingestion`;
+}
+
+function modelProvider(modelId: string): string {
+  const [provider] = modelId.split("/");
+  return provider || OPENROUTER_PROVIDER;
+}
+
+function dateFromPerfDelta(start: Date, deltaMs: number | null): Date | undefined {
+  return deltaMs === null ? undefined : new Date(start.getTime() + Math.max(0, deltaMs));
+}
+
+function langfuseLevel(status: ChatLog["status"]): "DEFAULT" | "WARNING" | "ERROR" {
+  if (status === "failed") return "ERROR";
+  if (status === "cancelled") return "WARNING";
+  return "DEFAULT";
+}
+
+function langfuseUsageDetails(usage: ChatLog["usage"]): Record<string, number> {
+  const details: Record<string, number> = {
+    input: usage.input_tokens,
+    output: usage.output_tokens,
+    total: usage.input_tokens + usage.output_tokens,
+  };
+  if (usage.cache_read_input_tokens !== undefined) {
+    details.cache_read_input_tokens = usage.cache_read_input_tokens;
+  }
+  if (usage.cache_creation_input_tokens !== undefined) {
+    details.cache_creation_input_tokens = usage.cache_creation_input_tokens;
+  }
+  return details;
+}
+
+async function sendLangfuseInference(event: LangfuseInferenceEvent): Promise<void> {
+  if (!langfuseConfigured()) return;
+
+  const { log, startTime, endTime, completionStartTime, requestedModel, modelParameters } = event;
+  const upstreamProvider = modelProvider(log.model);
+  const level = langfuseLevel(log.status);
+  const statusMessage = log.error || (log.status === "cancelled" ? "cancelled by client" : undefined);
+  const traceId = log.id;
+  const generationId = crypto.randomUUID();
+  const now = new Date().toISOString();
+  const metadata = cleanContext({
+    app: "local-chat",
+    request_id: log.request_id,
+    log_id: log.id,
+    provider: log.provider,
+    upstream_provider: upstreamProvider,
+    requested_model: requestedModel !== log.model ? requestedModel : undefined,
+    thinking_enabled: log.thinking_enabled,
+    thinking_budget: log.thinking_budget,
+    thinking_chars: log.thinking_content?.length,
+    status: log.status,
+  });
+  const input = {
+    system: log.system_prompt,
+    messages: log.messages,
+  };
+  const usageDetails = langfuseUsageDetails(log.usage);
+
+  const payload = {
+    batch: [
+      {
+        id: crypto.randomUUID(),
+        timestamp: now,
+        type: "trace-create",
+        body: {
+          id: traceId,
+          timestamp: startTime.toISOString(),
+          name: "local-chat",
+          input,
+          output: log.response || statusMessage || "",
+          sessionId: log.session_id,
+          metadata,
+          tags: ["local-chat", log.provider, upstreamProvider],
+        },
+      },
+      {
+        id: crypto.randomUUID(),
+        timestamp: now,
+        type: "generation-create",
+        body: {
+          id: generationId,
+          traceId,
+          name: "chat.completions",
+          startTime: startTime.toISOString(),
+          endTime: endTime.toISOString(),
+          completionStartTime: completionStartTime?.toISOString(),
+          model: log.model,
+          modelParameters: cleanContext(modelParameters),
+          input,
+          output: log.response,
+          usage: {
+            promptTokens: log.usage.input_tokens,
+            completionTokens: log.usage.output_tokens,
+            totalTokens: log.usage.input_tokens + log.usage.output_tokens,
+          },
+          usageDetails,
+          level,
+          statusMessage,
+          metadata,
+        },
+      },
+    ],
+    metadata: {
+      source: "local-chat",
+      sdk: "custom-ingestion",
+    },
+  };
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), LANGFUSE_REQUEST_TIMEOUT_MS);
+  try {
+    const res = await fetch(langfuseIngestionUrl(), {
+      method: "POST",
+      headers: {
+        Authorization: `Basic ${btoa(`${LANGFUSE_PUBLIC_KEY}:${LANGFUSE_SECRET_KEY}`)}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+    const responseText = await res.text();
+    let parsed: { errors?: unknown[] } | null = null;
+    try {
+      parsed = responseText ? JSON.parse(responseText) as { errors?: unknown[] } : null;
+    } catch {
+      parsed = null;
+    }
+
+    if (!res.ok || (parsed?.errors && parsed.errors.length > 0)) {
+      logger.warn("langfuse.ingestion_failed", {
+        request_id: log.request_id,
+        status: res.status,
+        errors: parsed?.errors,
+        body: !parsed ? responseText.slice(0, 300) : undefined,
+      });
+      return;
+    }
+
+    logger.debug("langfuse.ingestion_written", {
+      request_id: log.request_id,
+      trace_id: traceId,
+      generation_id: generationId,
+    });
+  } catch (error) {
+    logger.warn("langfuse.ingestion_error", {
+      request_id: log.request_id,
+      error: errorDetails(error),
+    });
+  } finally {
+    clearTimeout(timeout);
+  }
+}
 
 // ── Response Helpers ────────────────────────────────────────────────────────
 
@@ -301,26 +641,43 @@ async function hydrateModelCacheFromDisk(): Promise<void> {
       expiresAt: Date.now() + Math.max(0, MODEL_CACHE_TTL_MS - ageMs),
       models,
     };
-  } catch {
-    // Ignore malformed on-disk cache.
+    logger.info("models.cache.hydrated", {
+      path: MODEL_CACHE_JSON,
+      models: models.length,
+      fetched_at: fetchedAt,
+    });
+  } catch (error) {
+    logger.warn("models.cache.hydrate_failed", {
+      path: MODEL_CACHE_JSON,
+      error: errorDetails(error),
+    });
   }
 }
 
 async function fetchOpenRouterModels(forceRefresh = false): Promise<{ fetchedAt: string; models: ModelCatalogEntry[] }> {
   const now = Date.now();
   if (!forceRefresh && modelCatalogCache && modelCatalogCache.expiresAt > now) {
+    logger.debug("models.cache.hit", {
+      models: modelCatalogCache.models.length,
+      fetched_at: modelCatalogCache.fetchedAt,
+    });
     return { fetchedAt: modelCatalogCache.fetchedAt, models: modelCatalogCache.models };
   }
 
+  logger.info("models.fetch.start", { force_refresh: forceRefresh });
   const res = await fetch(OPENROUTER_MODELS_URL, {
     headers: {
       Authorization: `Bearer ${openRouterApiKey}`,
-      "HTTP-Referer": "http://localhost:3000",
+      "HTTP-Referer": `http://localhost:${PORT}`,
       "X-Title": "Local Chat",
     },
   });
   if (!res.ok) {
     if (modelCatalogCache) {
+      logger.warn("models.fetch.failed_using_cache", {
+        status: res.status,
+        fetched_at: modelCatalogCache.fetchedAt,
+      });
       return { fetchedAt: modelCatalogCache.fetchedAt, models: modelCatalogCache.models };
     }
     throw new Error(`OpenRouter /models failed with ${res.status}`);
@@ -336,7 +693,17 @@ async function fetchOpenRouterModels(forceRefresh = false): Promise<{ fetchedAt:
     expiresAt: now + MODEL_CACHE_TTL_MS,
     models,
   };
-  atomicWrite(MODEL_CACHE_JSON, JSON.stringify({ fetchedAt, models }, null, 2)).catch(console.error);
+  atomicWrite(MODEL_CACHE_JSON, JSON.stringify({ fetchedAt, models }, null, 2)).catch((error) => {
+    logger.warn("models.cache.write_failed", {
+      path: MODEL_CACHE_JSON,
+      error: errorDetails(error),
+    });
+  });
+
+  logger.info("models.fetch.complete", {
+    models: models.length,
+    fetched_at: fetchedAt,
+  });
 
   return { fetchedAt, models };
 }
@@ -357,7 +724,7 @@ async function fetchObsidianThemes(forceRefresh = false): Promise<{ fetchedAt: s
       withFileTypes: true,
       encoding: "utf8",
     });
-  } catch {
+  } catch (error) {
     const fetchedAt = new Date().toISOString();
     themeCatalogCache = {
       fetchedAt,
@@ -365,6 +732,10 @@ async function fetchObsidianThemes(forceRefresh = false): Promise<{ fetchedAt: s
       enabled: false,
       themes: [],
     };
+    logger.warn("themes.scan_unavailable", {
+      path: OBSIDIAN_THEMES_DIR,
+      error: errorDetails(error),
+    });
     return { fetchedAt, enabled: false, themes: [] };
   }
 
@@ -401,6 +772,10 @@ async function fetchObsidianThemes(forceRefresh = false): Promise<{ fetchedAt: s
     enabled: true,
     themes,
   };
+  logger.info("themes.scan.complete", {
+    path: OBSIDIAN_THEMES_DIR,
+    themes: themes.length,
+  });
   return { fetchedAt, enabled: true, themes };
 }
 
@@ -489,6 +864,26 @@ async function appendLog(log: ChatLog): Promise<void> {
   }
 }
 
+async function writeChatLog(log: ChatLog): Promise<void> {
+  try {
+    await appendLog(log);
+    logger.info("chat.log.written", {
+      request_id: log.request_id,
+      log_id: log.id,
+      status: log.status,
+      path: CHAT_LOGS_JSONL,
+    });
+  } catch (error) {
+    logger.error("chat.log.write_failed", {
+      request_id: log.request_id,
+      log_id: log.id,
+      status: log.status,
+      path: CHAT_LOGS_JSONL,
+      error: errorDetails(error),
+    });
+  }
+}
+
 function chatPath(id: string): string {
   return `${CHATS_DIR}/${id}.json`;
 }
@@ -496,13 +891,52 @@ function chatPath(id: string): string {
 async function readChat(id: string): Promise<SavedChat | null> {
   const file = Bun.file(chatPath(id));
   if (!(await file.exists())) return null;
-  try { return await file.json(); } catch { return null; }
+  try {
+    return await file.json();
+  } catch (error) {
+    logger.warn("chat.read_failed", {
+      chat_id: id,
+      path: chatPath(id),
+      error: errorDetails(error),
+    });
+    return null;
+  }
 }
 
 // ── Validation ──────────────────────────────────────────────────────────────
 
 function validateChatId(id: string): string | null {
   return CHAT_ID_RE.test(id) ? null : "Invalid chat ID";
+}
+
+function validateMessages(value: unknown):
+  | { ok: true; messages: Message[] }
+  | { ok: false; error: string } {
+
+  if (!Array.isArray(value)) {
+    return { ok: false, error: "Messages must be an array" };
+  }
+
+  const messages: Message[] = [];
+  for (const msg of value) {
+    if (!msg || typeof msg !== "object") {
+      return { ok: false, error: "Each message must be an object" };
+    }
+
+    const role = (msg as Record<string, unknown>).role;
+    const content = (msg as Record<string, unknown>).content;
+
+    if (role !== "user" && role !== "assistant") {
+      return { ok: false, error: "Message role must be 'user' or 'assistant'" };
+    }
+    if (typeof content !== "string") {
+      return { ok: false, error: "Message content must be a string" };
+    }
+
+    messages.push({ role, content });
+  }
+
+  return { ok: true, messages };
 }
 
 function validateChatRequest(body: unknown):
@@ -524,21 +958,9 @@ function validateChatRequest(body: unknown):
   if (!b.session_id || typeof b.session_id !== "string") {
     return { ok: false, error: "session_id is required" };
   }
-  if (!Array.isArray(b.messages)) {
-    return { ok: false, error: "Messages must be an array" };
-  }
 
-  for (const msg of b.messages) {
-    if (!msg || typeof msg !== "object") {
-      return { ok: false, error: "Each message must be an object" };
-    }
-    if (msg.role !== "user" && msg.role !== "assistant") {
-      return { ok: false, error: "Message role must be 'user' or 'assistant'" };
-    }
-    if (typeof msg.content !== "string") {
-      return { ok: false, error: "Message content must be a string" };
-    }
-  }
+  const parsedMessages = validateMessages(b.messages);
+  if (!parsedMessages.ok) return parsedMessages;
 
   let thinking: ChatRequest["thinking"];
   if (b.thinking !== undefined) {
@@ -549,7 +971,14 @@ function validateChatRequest(body: unknown):
     if (typeof t.enabled !== "boolean") {
       return { ok: false, error: "thinking.enabled must be a boolean" };
     }
-    if (t.budget_tokens !== undefined && (typeof t.budget_tokens !== "number" || t.budget_tokens < 1024)) {
+    if (
+      t.budget_tokens !== undefined &&
+      (
+        typeof t.budget_tokens !== "number" ||
+        !Number.isFinite(t.budget_tokens) ||
+        t.budget_tokens < 1024
+      )
+    ) {
       return { ok: false, error: "thinking.budget_tokens must be a number >= 1024" };
     }
     thinking = { enabled: t.enabled, budget_tokens: t.budget_tokens as number | undefined };
@@ -560,7 +989,7 @@ function validateChatRequest(body: unknown):
     data: {
       model: b.model.trim(),
       system: (b.system as string) || "",
-      messages: b.messages as Message[],
+      messages: parsedMessages.messages,
       session_id: b.session_id as string,
       thinking,
     },
@@ -569,7 +998,27 @@ function validateChatRequest(body: unknown):
 
 // ── Handlers: Chat Streaming ────────────────────────────────────────────────
 
-async function handleStream(req: Request): Promise<Response> {
+interface RequestContext {
+  requestId: string;
+  method: string;
+  pathname: string;
+  startedAt: number;
+}
+
+class StreamCancelledError extends Error {
+  constructor() {
+    super("Stream cancelled");
+    this.name = "StreamCancelledError";
+  }
+}
+
+function isAbortLikeError(error: unknown): boolean {
+  if (error instanceof StreamCancelledError) return true;
+  if (!(error instanceof Error)) return false;
+  return error.name === "AbortError" || error.message.toLowerCase().includes("abort");
+}
+
+async function handleStream(req: Request, ctx: RequestContext): Promise<Response> {
   let body: unknown;
   try { body = await req.json(); } catch {
     return errorResponse("Invalid JSON");
@@ -581,12 +1030,34 @@ async function handleStream(req: Request): Promise<Response> {
   const { model: requestedModel, system, messages, session_id, thinking } = v.data;
   const model = await resolveRequestedModelId(requestedModel);
   const logId = crypto.randomUUID();
+  const streamStartTime = new Date();
   const t0 = performance.now();
   let ttft: number | null = null;
   let ttfThinking: number | null = null;
   let fullResponse = "";
   let fullThinking = "";
   let upstreamUsage: Record<string, unknown> | undefined;
+  const thinkingRequested = thinking?.enabled === true;
+  const thinkingSupported = thinkingRequested ? supportsReasoningForModel(model) : false;
+
+  logger.info("chat.stream.start", {
+    request_id: ctx.requestId,
+    log_id: logId,
+    session_id,
+    requested_model: requestedModel !== model ? requestedModel : undefined,
+    model,
+    messages: messages.length,
+    system_prompt_chars: system.length,
+    thinking_requested: thinkingRequested,
+    thinking_sent: thinkingRequested && thinkingSupported,
+  });
+
+  if (thinkingRequested && !thinkingSupported) {
+    logger.info("chat.thinking.skipped_unsupported_model", {
+      request_id: ctx.requestId,
+      model,
+    });
+  }
 
   const openRouterMessages: Array<Record<string, unknown>> = [];
   if (system) {
@@ -618,16 +1089,46 @@ async function handleStream(req: Request): Promise<Response> {
     });
   }
 
+  const maxTokens = thinkingRequested && thinkingSupported ? 32000 : 8192;
+  const modelParameters: Record<string, unknown> = {
+    stream: true,
+    max_tokens: maxTokens,
+    thinking_enabled: thinkingRequested && thinkingSupported,
+    thinking_budget: thinking?.budget_tokens,
+  };
+  if (thinkingRequested && thinkingSupported) {
+    modelParameters.reasoning_effort = "high";
+  }
+
   const requestBody: Record<string, unknown> = {
     model,
     messages: openRouterMessages,
     stream: true,
     stream_options: { include_usage: true },
-    max_tokens: thinking?.enabled ? 32000 : 8192,
+    max_tokens: maxTokens,
     user: session_id,
   };
-  if (thinking?.enabled && supportsReasoningForModel(model)) {
+  if (thinkingRequested && thinkingSupported) {
     requestBody.reasoning = { effort: "high" };
+  }
+
+  const upstreamAbortController = new AbortController();
+  let upstreamReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+  let clientCancelled = req.signal.aborted;
+  const cancelUpstream = (reason: unknown = "client_cancelled") => {
+    clientCancelled = true;
+    if (!upstreamAbortController.signal.aborted) {
+      upstreamAbortController.abort(reason);
+    }
+    if (upstreamReader) {
+      upstreamReader.cancel(reason).catch(() => undefined);
+    }
+  };
+  const abortUpstream = () => cancelUpstream("client_cancelled");
+  if (req.signal.aborted) {
+    abortUpstream();
+  } else {
+    req.signal.addEventListener("abort", abortUpstream, { once: true });
   }
 
   let upstream: Response;
@@ -636,15 +1137,39 @@ async function handleStream(req: Request): Promise<Response> {
       method: "POST",
       headers: openRouterHeaders(),
       body: JSON.stringify(requestBody),
+      signal: upstreamAbortController.signal,
     });
   } catch (error) {
+    req.signal.removeEventListener("abort", abortUpstream);
+    if (clientCancelled || isAbortLikeError(error)) {
+      logger.info("chat.upstream.cancelled_before_stream", {
+        request_id: ctx.requestId,
+        log_id: logId,
+        model,
+      });
+      return new Response(null, { status: 499 });
+    }
     const msg = error instanceof Error ? error.message : "Failed to connect to OpenRouter";
+    logger.error("chat.upstream.connection_failed", {
+      request_id: ctx.requestId,
+      log_id: logId,
+      model,
+      error: errorDetails(error),
+    });
     return errorResponse(msg, 502);
   }
 
   if (!upstream.ok) {
+    req.signal.removeEventListener("abort", abortUpstream);
     const details = await upstream.text();
     const trimmed = details.trim().slice(0, 600);
+    logger.warn("chat.upstream.rejected", {
+      request_id: ctx.requestId,
+      log_id: logId,
+      model,
+      status: upstream.status,
+      details: trimmed || undefined,
+    });
     return errorResponse(
       trimmed
         ? `OpenRouter request failed (${upstream.status}): ${trimmed}`
@@ -653,6 +1178,12 @@ async function handleStream(req: Request): Promise<Response> {
     );
   }
   if (!upstream.body) {
+    req.signal.removeEventListener("abort", abortUpstream);
+    logger.error("chat.upstream.empty_stream", {
+      request_id: ctx.requestId,
+      log_id: logId,
+      model,
+    });
     return errorResponse("OpenRouter response did not include a stream", 502);
   }
 
@@ -660,16 +1191,73 @@ async function handleStream(req: Request): Promise<Response> {
   const sse = (obj: Record<string, unknown>) =>
     encoder.encode(`data: ${JSON.stringify(obj)}\n\n`);
 
+  async function persistStreamOutcome(
+    status: ChatLog["status"],
+    error?: string,
+  ): Promise<{ log: ChatLog; usage: ChatLog["usage"]; latency: ChatLog["latency"] }> {
+    const elapsed = performance.now() - t0;
+    const usage = normalizeUsage(upstreamUsage);
+    const latency = {
+      time_to_first_token_ms: Math.round(ttft ?? elapsed),
+      total_time_ms: Math.round(elapsed),
+      time_to_first_thinking_ms: ttfThinking !== null ? Math.round(ttfThinking) : undefined,
+    };
+    const log: ChatLog = {
+      id: logId,
+      request_id: ctx.requestId,
+      status,
+      session_id,
+      timestamp: new Date().toISOString(),
+      provider: OPENROUTER_PROVIDER,
+      model,
+      requested_model: requestedModel !== model ? requestedModel : undefined,
+      system_prompt: system,
+      messages,
+      response: fullResponse,
+      thinking_content: fullThinking || undefined,
+      usage,
+      latency,
+      thinking_enabled: thinking?.enabled,
+      thinking_budget: thinking?.budget_tokens,
+      error,
+    };
+
+    await writeChatLog(log);
+    void sendLangfuseInference({
+      log,
+      startTime: streamStartTime,
+      endTime: new Date(),
+      completionStartTime: dateFromPerfDelta(streamStartTime, ttft),
+      requestedModel,
+      modelParameters,
+    });
+
+    return { log, usage, latency };
+  }
+
   const readable = new ReadableStream({
     async start(controller) {
-      const reader = upstream.body!.getReader();
+      upstreamReader = upstream.body!.getReader();
+      const reader = upstreamReader;
       const decoder = new TextDecoder();
       let buffer = "";
 
+      const enqueue = (obj: Record<string, unknown>) => {
+        if (clientCancelled) throw new StreamCancelledError();
+        try {
+          controller.enqueue(sse(obj));
+        } catch {
+          cancelUpstream("client_cancelled");
+          throw new StreamCancelledError();
+        }
+      };
+
       try {
         while (true) {
+          if (clientCancelled) throw new StreamCancelledError();
           const { done, value } = await reader.read();
           if (done) break;
+          if (clientCancelled) throw new StreamCancelledError();
           buffer += decoder.decode(value, { stream: true });
 
           let boundary = buffer.indexOf("\n\n");
@@ -715,17 +1303,19 @@ async function handleStream(req: Request): Promise<Response> {
             if (text) {
               ttft ??= performance.now() - t0;
               fullResponse += text;
-              controller.enqueue(sse({ type: "delta", text }));
+              enqueue({ type: "delta", text });
             }
 
             const thinkingDelta = extractThinkingDelta(delta as Record<string, unknown>);
             if (thinkingDelta) {
               ttfThinking ??= performance.now() - t0;
               fullThinking += thinkingDelta;
-              controller.enqueue(sse({ type: "thinking_delta", thinking: thinkingDelta }));
+              enqueue({ type: "thinking_delta", thinking: thinkingDelta });
             }
           }
         }
+
+        if (clientCancelled) throw new StreamCancelledError();
 
         if (buffer.startsWith("data:")) {
           try {
@@ -738,58 +1328,69 @@ async function handleStream(req: Request): Promise<Response> {
           }
         }
 
-        const elapsed = performance.now() - t0;
-        const usage = normalizeUsage(upstreamUsage);
+        const { usage, latency } = await persistStreamOutcome("completed");
 
-        appendLog({
-          id: logId,
+        logger.info("chat.stream.complete", {
+          request_id: ctx.requestId,
+          log_id: logId,
           session_id,
-          timestamp: new Date().toISOString(),
           model,
-          system_prompt: system,
-          messages,
-          response: fullResponse,
-          thinking_content: fullThinking || undefined,
-          usage,
-          latency: {
-            time_to_first_token_ms: Math.round(ttft ?? elapsed),
-            total_time_ms: Math.round(elapsed),
-            time_to_first_thinking_ms: ttfThinking ? Math.round(ttfThinking) : undefined,
-          },
-          thinking_enabled: thinking?.enabled,
-          thinking_budget: thinking?.budget_tokens,
-        }).catch(console.error);
+          input_tokens: usage.input_tokens,
+          output_tokens: usage.output_tokens,
+          cache_read_input_tokens: usage.cache_read_input_tokens,
+          total_time_ms: latency.total_time_ms,
+          time_to_first_token_ms: latency.time_to_first_token_ms,
+          response_chars: fullResponse.length,
+          thinking_chars: fullThinking.length || undefined,
+        });
 
-        controller.enqueue(sse({ type: "done", usage }));
+        enqueue({ type: "done", usage });
       } catch (error) {
-        const msg = error instanceof Error ? error.message : "Unknown error";
-        const elapsed = performance.now() - t0;
+        const cancelled = clientCancelled || isAbortLikeError(error);
+        const msg = cancelled
+          ? "Stream cancelled"
+          : error instanceof Error ? error.message : "Unknown error";
+        const { latency } = await persistStreamOutcome(
+          cancelled ? "cancelled" : "failed",
+          cancelled ? "cancelled by client" : msg,
+        );
 
-        appendLog({
-          id: logId,
+        const event = cancelled ? "chat.stream.cancelled" : "chat.stream.failed";
+        logger[cancelled ? "info" : "error"](event, {
+          request_id: ctx.requestId,
+          log_id: logId,
           session_id,
-          timestamp: new Date().toISOString(),
           model,
-          system_prompt: system,
-          messages,
-          response: fullResponse,
-          thinking_content: fullThinking || undefined,
-          usage: { input_tokens: 0, output_tokens: 0 },
-          latency: {
-            time_to_first_token_ms: Math.round(ttft ?? elapsed),
-            total_time_ms: Math.round(elapsed),
-            time_to_first_thinking_ms: ttfThinking ? Math.round(ttfThinking) : undefined,
-          },
-          thinking_enabled: thinking?.enabled,
-          thinking_budget: thinking?.budget_tokens,
-          error: msg,
-        }).catch(console.error);
+          total_time_ms: latency.total_time_ms,
+          response_chars: fullResponse.length,
+          thinking_chars: fullThinking.length || undefined,
+          error: cancelled ? undefined : errorDetails(error),
+        });
 
-        controller.enqueue(sse({ type: "error", error: msg }));
+        if (!cancelled) {
+          try {
+            controller.enqueue(sse({ type: "error", error: msg }));
+          } catch {
+            cancelUpstream("client_cancelled");
+          }
+        }
       } finally {
-        reader.releaseLock();
-        controller.close();
+        req.signal.removeEventListener("abort", abortUpstream);
+        try {
+          reader.releaseLock();
+        } catch {
+          // The reader may already be released after cancellation.
+        }
+        upstreamReader = null;
+        try {
+          controller.close();
+        } catch {
+          // The client may have already closed the stream.
+        }
       }
+    },
+    cancel(reason) {
+      cancelUpstream(reason);
     },
   });
 
@@ -877,7 +1478,17 @@ async function handleThemeCss(id: string): Promise<Response> {
 // ── Handlers: Chat CRUD ─────────────────────────────────────────────────────
 
 async function handleListChats(): Promise<Response> {
-  const files = await readdir(CHATS_DIR);
+  let files: string[];
+  try {
+    files = await readdir(CHATS_DIR);
+  } catch (error) {
+    logger.warn("chats.list_failed", {
+      path: CHATS_DIR,
+      error: errorDetails(error),
+    });
+    return jsonResponse({ chats: [] });
+  }
+
   const chats = [];
 
   for (const file of files) {
@@ -893,7 +1504,12 @@ async function handleListChats(): Promise<Response> {
         messageCount: data.messages.length,
         preview: firstUser?.content.slice(0, 100) || "",
       });
-    } catch { /* skip corrupt files */ }
+    } catch (error) {
+      logger.warn("chats.list_skip_invalid_file", {
+        file,
+        error: errorDetails(error),
+      });
+    }
   }
 
   chats.sort((a, b) => +new Date(b.updatedAt) - +new Date(a.updatedAt));
@@ -915,13 +1531,15 @@ async function handleSaveChat(req: Request): Promise<Response> {
   }
 
   const b = body as Record<string, unknown>;
+  if (!body || typeof body !== "object") {
+    return errorResponse("Invalid request body");
+  }
 
   if (!b.sessionId || typeof b.sessionId !== "string") {
     return errorResponse("sessionId is required");
   }
-  if (!Array.isArray(b.messages)) {
-    return errorResponse("messages must be an array");
-  }
+  const parsedMessages = validateMessages(b.messages);
+  if (!parsedMessages.ok) return errorResponse(parsedMessages.error);
 
   const id = (typeof b.id === "string" && CHAT_ID_RE.test(b.id)) ? b.id : crypto.randomUUID();
   const now = new Date().toISOString();
@@ -939,7 +1557,7 @@ async function handleSaveChat(req: Request): Promise<Response> {
           model: str(b.model) || existing.model || DEFAULT_MODEL,
           systemPrompt: b.systemPrompt != null ? str(b.systemPrompt) : existing.systemPrompt,
           thinkingEnabled: typeof b.thinkingEnabled === "boolean" ? b.thinkingEnabled : existing.thinkingEnabled,
-          messages: b.messages as Message[],
+          messages: parsedMessages.messages,
           ...(str(b.title) && { title: str(b.title) }),
         }
       : {
@@ -953,10 +1571,17 @@ async function handleSaveChat(req: Request): Promise<Response> {
           model: str(b.model) || DEFAULT_MODEL,
           systemPrompt: str(b.systemPrompt) || "",
           thinkingEnabled: typeof b.thinkingEnabled === "boolean" ? b.thinkingEnabled : false,
-          messages: b.messages as Message[],
+          messages: parsedMessages.messages,
         };
 
     await atomicWrite(chatPath(id), JSON.stringify(chat, null, 2));
+
+    logger.info("chat.saved", {
+      chat_id: chat.id,
+      message_count: chat.messages.length,
+      model: chat.model,
+      created: !existing,
+    });
 
     return jsonResponse({
       id: chat.id,
@@ -979,7 +1604,8 @@ async function handleRenameChat(id: string, req: Request): Promise<Response> {
   }
 
   const { title } = body as Record<string, unknown>;
-  if (!title || typeof title !== "string") {
+  const nextTitle = typeof title === "string" ? title.trim() : "";
+  if (!nextTitle) {
     return errorResponse("title is required");
   }
 
@@ -988,14 +1614,60 @@ async function handleRenameChat(id: string, req: Request): Promise<Response> {
     const chat = await readChat(id);
     if (!chat) return notFound("Chat not found");
 
-    chat.title = title;
+    chat.title = nextTitle;
     chat.updatedAt = new Date().toISOString();
     await atomicWrite(chatPath(id), JSON.stringify(chat, null, 2));
+
+    logger.info("chat.renamed", {
+      chat_id: chat.id,
+      title_chars: chat.title.length,
+    });
 
     return jsonResponse({ id: chat.id, title: chat.title, updatedAt: chat.updatedAt });
   } finally {
     release();
   }
+}
+
+async function handleDuplicateChat(id: string): Promise<Response> {
+  const err = validateChatId(id);
+  if (err) return errorResponse(err);
+
+  const sourceRelease = await mutexFor(id).acquire();
+  let source: SavedChat | null;
+  try {
+    source = await readChat(id);
+  } finally {
+    sourceRelease();
+  }
+  if (!source) return notFound("Chat not found");
+
+  const duplicateId = crypto.randomUUID();
+  const now = new Date().toISOString();
+  const duplicate: SavedChat = {
+    ...source,
+    id: duplicateId,
+    title: `${source.title || "New Chat"} (copy)`,
+    createdAt: now,
+    updatedAt: now,
+    sessionId: crypto.randomUUID(),
+    messages: source.messages.map((message) => ({ ...message })),
+  };
+
+  const release = await mutexFor(duplicateId).acquire();
+  try {
+    await atomicWrite(chatPath(duplicateId), JSON.stringify(duplicate, null, 2));
+  } finally {
+    release();
+  }
+
+  logger.info("chat.duplicated", {
+    chat_id: id,
+    duplicate_chat_id: duplicateId,
+    message_count: duplicate.messages.length,
+  });
+
+  return jsonResponse(duplicate);
 }
 
 async function handleDeleteChat(id: string): Promise<Response> {
@@ -1008,6 +1680,7 @@ async function handleDeleteChat(id: string): Promise<Response> {
       return notFound("Chat not found");
     }
     await unlink(chatPath(id));
+    logger.info("chat.deleted", { chat_id: id });
     return jsonResponse({ success: true });
   } finally {
     release();
@@ -1036,12 +1709,26 @@ const MIME: Record<string, string> = {
 const STATIC_CACHE = "no-cache";
 
 async function serveStatic(pathname: string): Promise<Response> {
-  const filePath = `./public${pathname === "/" ? "/index.html" : pathname}`;
+  let requestedPath: string;
+  try {
+    requestedPath = decodeURIComponent(pathname === "/" ? "/index.html" : pathname);
+  } catch {
+    return errorResponse("Invalid path");
+  }
+
+  if (requestedPath.includes("\0")) return notFound();
+
+  const filePath = resolve(PUBLIC_DIR, `.${requestedPath}`);
+  if (filePath !== PUBLIC_DIR && !filePath.startsWith(PUBLIC_DIR + sep)) {
+    logger.warn("static.path_traversal_blocked", { pathname });
+    return notFound();
+  }
+
   const file = Bun.file(filePath);
 
   if (!(await file.exists())) return notFound();
 
-  const ext = filePath.slice(filePath.lastIndexOf("."));
+  const ext = extname(filePath);
   return new Response(file, {
     headers: {
       "Content-Type": MIME[ext] || "application/octet-stream",
@@ -1052,7 +1739,7 @@ async function serveStatic(pathname: string): Promise<Response> {
 
 // ── Router ──────────────────────────────────────────────────────────────────
 
-type Handler = (req: Request, params: Record<string, string>) => Promise<Response>;
+type Handler = (req: Request, params: Record<string, string>, ctx: RequestContext) => Promise<Response>;
 
 interface Route {
   method: string;
@@ -1065,12 +1752,13 @@ function route(method: string, path: string, handler: Handler): Route {
 }
 
 const routes: Route[] = [
-  route("POST", "/api/chat",       (req) => handleStream(req)),
+  route("POST", "/api/chat",       (req, _params, ctx) => handleStream(req, ctx)),
   route("GET",  "/api/models",     (req) => handleModels(req)),
   route("GET",  "/api/themes",     (req) => handleThemes(req)),
   route("GET",  "/api/themes/:id.css", (_req, p) => handleThemeCss(p.id)),
   route("GET",  "/api/chats",      ()    => handleListChats()),
   route("POST", "/api/chats",      (req) => handleSaveChat(req)),
+  route("POST", "/api/chats/:id/duplicate", (_req, p) => handleDuplicateChat(p.id)),
   route("GET",  "/api/chats/:id",  (_req, p) => handleGetChat(p.id)),
   route("PATCH","/api/chats/:id",  (req, p) => handleRenameChat(p.id, req)),
   route("DELETE","/api/chats/:id", (_req, p) => handleDeleteChat(p.id)),
@@ -1085,18 +1773,58 @@ await hydrateModelCacheFromDisk();
 const server = Bun.serve({
   port: PORT,
   async fetch(req) {
-    const method = req.method;
+    const url = new URL(req.url);
+    const ctx: RequestContext = {
+      requestId: crypto.randomUUID(),
+      method: req.method,
+      pathname: url.pathname,
+      startedAt: performance.now(),
+    };
 
-    for (const r of routes) {
-      if (r.method !== method) continue;
-      const match = r.pattern.exec(req.url);
-      if (!match) continue;
-      return r.handler(req, (match.pathname.groups || {}) as Record<string, string>);
+    let response: Response;
+    try {
+      response = await routeRequest(req, ctx);
+    } catch (error) {
+      logger.error("request.unhandled_error", {
+        request_id: ctx.requestId,
+        method: ctx.method,
+        path: ctx.pathname,
+        error: errorDetails(error),
+      });
+      response = errorResponse("Internal server error", 500);
     }
 
-    // Fall through to static files
-    return serveStatic(new URL(req.url).pathname);
+    const durationMs = Math.round(performance.now() - ctx.startedAt);
+    const level: LogLevel = response.status >= 500 ? "error" : response.status >= 400 ? "warn" : "info";
+    logger[level]("request.completed", {
+      request_id: ctx.requestId,
+      method: ctx.method,
+      path: ctx.pathname,
+      status: response.status,
+      duration_ms: durationMs,
+    });
+
+    response.headers.set("X-Request-Id", ctx.requestId);
+    return response;
   },
 });
 
-console.log(`Server running at http://localhost:${server.port}`);
+async function routeRequest(req: Request, ctx: RequestContext): Promise<Response> {
+  for (const r of routes) {
+    if (r.method !== ctx.method) continue;
+    const match = r.pattern.exec(req.url);
+    if (!match) continue;
+    return r.handler(req, (match.pathname.groups || {}) as Record<string, string>, ctx);
+  }
+
+  return serveStatic(ctx.pathname);
+}
+
+logger.info("server.started", {
+  url: `http://localhost:${server.port}`,
+  port: server.port,
+  logs_dir: LOGS_DIR,
+  chats_dir: CHATS_DIR,
+  openrouter_base_url: OPENROUTER_API_BASE,
+  langfuse_enabled: langfuseConfigured(),
+});
