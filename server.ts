@@ -82,6 +82,11 @@ function parsePort(raw: string | undefined): number {
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : 3000;
 }
 
+function parsePositiveInteger(raw: string | undefined, fallback: number): number {
+  const parsed = Number.parseInt(raw || "", 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
 const PORT = parsePort(process.env.PORT);
 const LOGS_DIR = process.env.LOGS_DIR || "./logs";
 const CHATS_DIR = `${LOGS_DIR}/chats`;
@@ -97,6 +102,8 @@ const LANGFUSE_PUBLIC_KEY = process.env.LANGFUSE_PUBLIC_KEY || "";
 const LANGFUSE_SECRET_KEY = process.env.LANGFUSE_SECRET_KEY || "";
 const LANGFUSE_BASE_URL = (process.env.LANGFUSE_BASE_URL || "https://cloud.langfuse.com").replace(/\/+$/, "");
 const LANGFUSE_REQUEST_TIMEOUT_MS = 4_000;
+const OPENROUTER_CONNECT_TIMEOUT_MS = parsePositiveInteger(process.env.OPENROUTER_CONNECT_TIMEOUT_MS, 60_000);
+const OPENROUTER_STREAM_IDLE_TIMEOUT_MS = parsePositiveInteger(process.env.OPENROUTER_STREAM_IDLE_TIMEOUT_MS, 60_000);
 const MODEL_CACHE_TTL_MS = 5 * 60 * 1000;
 const THEME_CACHE_TTL_MS = 60 * 1000;
 const DEFAULT_OBSIDIAN_THEMES_DIR = "/Users/sumukshashidhar/Documents/root/resources/reflection/.obsidian/themes";
@@ -1024,10 +1031,25 @@ class StreamCancelledError extends Error {
   }
 }
 
+class UpstreamTimeoutError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "UpstreamTimeoutError";
+  }
+}
+
+function formatTimeoutMs(ms: number): string {
+  return ms % 1000 === 0 ? `${ms / 1000}s` : `${ms}ms`;
+}
+
 function isAbortLikeError(error: unknown): boolean {
   if (error instanceof StreamCancelledError) return true;
   if (!(error instanceof Error)) return false;
   return error.name === "AbortError" || error.message.toLowerCase().includes("abort");
+}
+
+function isUpstreamTimeoutError(error: unknown): boolean {
+  return error instanceof UpstreamTimeoutError;
 }
 
 function reasoningConfigForThinking(thinking: ChatRequest["thinking"]): Record<string, unknown> | undefined {
@@ -1139,6 +1161,8 @@ async function handleStream(req: Request, ctx: RequestContext): Promise<Response
   const upstreamAbortController = new AbortController();
   let upstreamReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
   let clientCancelled = req.signal.aborted;
+  let upstreamTimedOut = false;
+  let upstreamTimeoutMessage = "";
   const cancelUpstream = (reason: unknown = "client_cancelled") => {
     clientCancelled = true;
     if (!upstreamAbortController.signal.aborted) {
@@ -1146,6 +1170,17 @@ async function handleStream(req: Request, ctx: RequestContext): Promise<Response
     }
     if (upstreamReader) {
       upstreamReader.cancel(reason).catch(() => undefined);
+    }
+  };
+  const timeoutUpstream = (message: string) => {
+    upstreamTimedOut = true;
+    upstreamTimeoutMessage = message;
+    const error = new UpstreamTimeoutError(message);
+    if (!upstreamAbortController.signal.aborted) {
+      upstreamAbortController.abort(error);
+    }
+    if (upstreamReader) {
+      upstreamReader.cancel(error).catch(() => undefined);
     }
   };
   const abortUpstream = () => cancelUpstream("client_cancelled");
@@ -1156,6 +1191,18 @@ async function handleStream(req: Request, ctx: RequestContext): Promise<Response
   }
 
   let upstream: Response;
+  let connectTimeout: ReturnType<typeof setTimeout> | null = setTimeout(() => {
+    timeoutUpstream(
+      `OpenRouter request timed out after ${formatTimeoutMs(OPENROUTER_CONNECT_TIMEOUT_MS)} before the stream started`,
+    );
+  }, OPENROUTER_CONNECT_TIMEOUT_MS);
+  const clearConnectTimeout = () => {
+    if (connectTimeout) {
+      clearTimeout(connectTimeout);
+      connectTimeout = null;
+    }
+  };
+
   try {
     upstream = await fetch(OPENROUTER_CHAT_URL, {
       method: "POST",
@@ -1164,7 +1211,17 @@ async function handleStream(req: Request, ctx: RequestContext): Promise<Response
       signal: upstreamAbortController.signal,
     });
   } catch (error) {
+    clearConnectTimeout();
     req.signal.removeEventListener("abort", abortUpstream);
+    if (upstreamTimedOut) {
+      logger.warn("chat.upstream.timeout_before_stream", {
+        request_id: ctx.requestId,
+        log_id: logId,
+        model,
+        timeout_ms: OPENROUTER_CONNECT_TIMEOUT_MS,
+      });
+      return errorResponse(upstreamTimeoutMessage, 504);
+    }
     if (clientCancelled || isAbortLikeError(error)) {
       logger.info("chat.upstream.cancelled_before_stream", {
         request_id: ctx.requestId,
@@ -1182,6 +1239,7 @@ async function handleStream(req: Request, ctx: RequestContext): Promise<Response
     });
     return errorResponse(msg, 502);
   }
+  clearConnectTimeout();
 
   if (!upstream.ok) {
     req.signal.removeEventListener("abort", abortUpstream);
@@ -1265,6 +1323,7 @@ async function handleStream(req: Request, ctx: RequestContext): Promise<Response
       const reader = upstreamReader;
       const decoder = new TextDecoder();
       let buffer = "";
+      let streamIdleTimeout: ReturnType<typeof setTimeout> | null = null;
 
       const enqueue = (obj: Record<string, unknown>) => {
         if (clientCancelled) throw new StreamCancelledError();
@@ -1276,12 +1335,30 @@ async function handleStream(req: Request, ctx: RequestContext): Promise<Response
         }
       };
 
+      const clearStreamIdleTimeout = () => {
+        if (streamIdleTimeout) {
+          clearTimeout(streamIdleTimeout);
+          streamIdleTimeout = null;
+        }
+      };
+      const resetStreamIdleTimeout = () => {
+        clearStreamIdleTimeout();
+        streamIdleTimeout = setTimeout(() => {
+          timeoutUpstream(
+            `OpenRouter stream timed out after ${formatTimeoutMs(OPENROUTER_STREAM_IDLE_TIMEOUT_MS)} without data`,
+          );
+        }, OPENROUTER_STREAM_IDLE_TIMEOUT_MS);
+      };
+
       try {
+        resetStreamIdleTimeout();
         while (true) {
           if (clientCancelled) throw new StreamCancelledError();
           const { done, value } = await reader.read();
+          if (upstreamTimedOut) throw new UpstreamTimeoutError(upstreamTimeoutMessage);
           if (done) break;
           if (clientCancelled) throw new StreamCancelledError();
+          resetStreamIdleTimeout();
           buffer += decoder.decode(value, { stream: true });
 
           let boundary = buffer.indexOf("\n\n");
@@ -1340,6 +1417,8 @@ async function handleStream(req: Request, ctx: RequestContext): Promise<Response
         }
 
         if (clientCancelled) throw new StreamCancelledError();
+        if (upstreamTimedOut) throw new UpstreamTimeoutError(upstreamTimeoutMessage);
+        clearStreamIdleTimeout();
 
         if (buffer.startsWith("data:")) {
           try {
@@ -1370,8 +1449,11 @@ async function handleStream(req: Request, ctx: RequestContext): Promise<Response
 
         enqueue({ type: "done", usage, latency });
       } catch (error) {
-        const cancelled = clientCancelled || isAbortLikeError(error);
-        const msg = cancelled
+        const timedOut = upstreamTimedOut || isUpstreamTimeoutError(error);
+        const cancelled = !timedOut && (clientCancelled || isAbortLikeError(error));
+        const msg = timedOut
+          ? upstreamTimeoutMessage || "OpenRouter stream timed out"
+          : cancelled
           ? "Stream cancelled"
           : error instanceof Error ? error.message : "Unknown error";
         const { latency } = await persistStreamOutcome(
@@ -1379,8 +1461,9 @@ async function handleStream(req: Request, ctx: RequestContext): Promise<Response
           cancelled ? "cancelled by client" : msg,
         );
 
-        const event = cancelled ? "chat.stream.cancelled" : "chat.stream.failed";
-        logger[cancelled ? "info" : "error"](event, {
+        const event = timedOut ? "chat.stream.timeout" : cancelled ? "chat.stream.cancelled" : "chat.stream.failed";
+        const logLevel: LogLevel = timedOut ? "warn" : cancelled ? "info" : "error";
+        logger[logLevel](event, {
           request_id: ctx.requestId,
           log_id: logId,
           session_id,
@@ -1388,6 +1471,7 @@ async function handleStream(req: Request, ctx: RequestContext): Promise<Response
           total_time_ms: latency.total_time_ms,
           response_chars: fullResponse.length,
           thinking_chars: fullThinking.length || undefined,
+          timeout_ms: timedOut ? OPENROUTER_STREAM_IDLE_TIMEOUT_MS : undefined,
           error: cancelled ? undefined : errorDetails(error),
         });
 
@@ -1399,6 +1483,7 @@ async function handleStream(req: Request, ctx: RequestContext): Promise<Response
           }
         }
       } finally {
+        clearStreamIdleTimeout();
         req.signal.removeEventListener("abort", abortUpstream);
         try {
           reader.releaseLock();

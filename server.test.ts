@@ -54,6 +54,20 @@ function startMockOpenRouter(): ReturnType<typeof Bun.serve> {
         openRouterChatBodies.push(body);
         const bodyText = JSON.stringify(body);
 
+        if (bodyText.includes("idle-timeout")) {
+          return new Response(
+            new ReadableStream({
+              start(controller) {
+                controller.enqueue(encoder.encode(": heartbeat\n\n"));
+              },
+              cancel() {
+                mockOpenRouterCancelCount += 1;
+              },
+            }),
+            { headers: { "Content-Type": "text/event-stream" } },
+          );
+        }
+
         if (bodyText.includes("slow-cancel")) {
           let interval: ReturnType<typeof setInterval> | null = null;
           return new Response(
@@ -201,6 +215,8 @@ beforeAll(async () => {
     [
       "OPENROUTER_API_KEY=test-key",
       `OPENROUTER_API_BASE=${mockOpenRouter.url.origin}/api/v1`,
+      "OPENROUTER_CONNECT_TIMEOUT_MS=120",
+      "OPENROUTER_STREAM_IDLE_TIMEOUT_MS=120",
       "LANGFUSE_ENABLED=1",
       "LANGFUSE_PUBLIC_KEY=pk-test",
       "LANGFUSE_SECRET_KEY=sk-test",
@@ -480,6 +496,75 @@ describe("Chat API", () => {
           );
         });
     }, "cancelled stream log");
+  });
+
+  test("POST /api/chat records stalled upstream streams as timeout failures", async () => {
+    const model = await getAnyModel();
+    const sessionId = `idle-timeout-session-${Date.now()}`;
+
+    const res = await fetch(`${BASE_URL}/api/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model,
+        system: "",
+        messages: [{ role: "user", content: "idle-timeout" }],
+        session_id: sessionId,
+      }),
+    });
+
+    expect(res.status).toBe(200);
+    const reader = res.body?.getReader();
+    expect(reader).toBeTruthy();
+
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let errorEvent: Record<string, unknown> | null = null;
+
+    while (!errorEvent) {
+      const chunk = await Promise.race([
+        reader!.read(),
+        Bun.sleep(2_000).then(() => {
+          throw new Error("Timed out waiting for stalled stream error event");
+        }),
+      ]);
+      if (chunk.done) break;
+
+      buffer += decoder.decode(chunk.value, { stream: true });
+      const events = buffer.split("\n\n");
+      buffer = events.pop() || "";
+      for (const event of events) {
+        const payload = event
+          .split("\n")
+          .find((line) => line.startsWith("data: "))
+          ?.slice(6);
+        if (!payload) continue;
+        const data = JSON.parse(payload) as Record<string, unknown>;
+        if (data.type === "error") {
+          errorEvent = data;
+          break;
+        }
+      }
+    }
+
+    expect(errorEvent?.error).toContain("OpenRouter stream timed out");
+
+    await waitForCondition(async () => {
+      const logText = await readFile(join(testLogsDir, "chat_logs.jsonl"), "utf8").catch(() => "");
+      return logText
+        .trim()
+        .split("\n")
+        .filter(Boolean)
+        .some((line) => {
+          const log = JSON.parse(line) as Record<string, unknown>;
+          return (
+            log.session_id === sessionId &&
+            log.status === "failed" &&
+            typeof log.error === "string" &&
+            log.error.includes("OpenRouter stream timed out")
+          );
+        });
+    }, "stalled stream timeout log");
   });
 
   test("POST /api/chats/:id/duplicate creates an independent chat copy", async () => {
