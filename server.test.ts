@@ -11,6 +11,7 @@ let testRoot = "";
 let testLogsDir = "";
 let mockOpenRouterCancelCount = 0;
 const langfuseBatches: Array<{ auth: string | null; body: Record<string, unknown> }> = [];
+const openRouterChatBodies: Array<Record<string, unknown>> = [];
 
 function randomPort(): number {
   return 39_000 + Math.floor(Math.random() * 10_000);
@@ -37,7 +38,12 @@ function startMockOpenRouter(): ReturnType<typeof Bun.serve> {
               description: "Mock model for local tests",
               context_length: 1_048_576,
               supported_parameters: ["reasoning", "include_usage"],
-              pricing: { prompt: "0", completion: "0" },
+              pricing: {
+                prompt: "0.000002",
+                completion: "0.000012",
+                input_cache_read: "0.0000005",
+                input_cache_write: "0.000002",
+              },
             },
           ],
         });
@@ -45,6 +51,7 @@ function startMockOpenRouter(): ReturnType<typeof Bun.serve> {
 
       if (url.pathname === "/api/v1/chat/completions") {
         const body = await req.json().catch(() => ({})) as Record<string, unknown>;
+        openRouterChatBodies.push(body);
         const bodyText = JSON.stringify(body);
 
         if (bodyText.includes("slow-cancel")) {
@@ -85,7 +92,7 @@ function startMockOpenRouter(): ReturnType<typeof Bun.serve> {
                 usage: {
                   prompt_tokens: 12,
                   completion_tokens: 1,
-                  prompt_tokens_details: { cached_tokens: 4 },
+                  prompt_tokens_details: { cached_tokens: 4, cache_write_tokens: 2 },
                 },
               })));
               controller.enqueue(encoder.encode(sse("[DONE]")));
@@ -250,6 +257,8 @@ describe("Chat API", () => {
     expect(Array.isArray(data.models)).toBe(true);
     expect(data.models.length).toBeGreaterThan(0);
     expect(data.models[0].id).toBe("google/gemini-2.0-flash-001");
+    expect(data.models[0].pricing.input_cache_read).toBe("0.0000005");
+    expect(data.models[0].pricing.input_cache_write).toBe("0.000002");
   });
 
   test("GET /api/themes returns theme metadata", async () => {
@@ -343,6 +352,7 @@ describe("Chat API", () => {
     expect(doneEvent?.usage.input_tokens).toBe(12);
     expect(doneEvent?.usage.output_tokens).toBe(1);
     expect(doneEvent?.usage.cache_read_input_tokens).toBe(4);
+    expect(doneEvent?.usage.cache_creation_input_tokens).toBe(2);
     expect(typeof doneEvent?.latency?.total_time_ms).toBe("number");
     expect(doneEvent?.latency?.total_time_ms).toBeGreaterThanOrEqual(0);
     expect(typeof doneEvent?.latency?.time_to_first_token_ms).toBe("number");
@@ -356,6 +366,7 @@ describe("Chat API", () => {
       expect(lastLog.response).toBe("OK");
       expect(lastLog.usage.input_tokens).toBe(12);
       expect(lastLog.usage.output_tokens).toBe(1);
+      expect(lastLog.usage.cache_creation_input_tokens).toBe(2);
     }
 
     await waitForCondition(() => langfuseBatches.length > 0, "LangFuse ingestion");
@@ -371,6 +382,7 @@ describe("Chat API", () => {
     expect(generationEvent?.body.output).toBe("OK");
     expect((generationEvent?.body.usageDetails as Record<string, number>).input).toBe(12);
     expect((generationEvent?.body.usageDetails as Record<string, number>).output).toBe(1);
+    expect((generationEvent?.body.usageDetails as Record<string, number>).cache_creation_input_tokens).toBe(2);
   });
 
   test("POST /api/chat accepts a conversation ending with an assistant turn (continuation)", async () => {
@@ -510,6 +522,81 @@ describe("Chat API", () => {
 
     const getDuplicateRes = await fetch(`${BASE_URL}/api/chats/${duplicate.id}`);
     expect(getDuplicateRes.status).toBe(200);
+  });
+
+  test("POST /api/chat sends xhigh reasoning effort for thinking requests", async () => {
+    const model = await getAnyModel();
+    openRouterChatBodies.length = 0;
+
+    const res = await fetch(`${BASE_URL}/api/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model,
+        system: "",
+        messages: [{ role: "user", content: "Budget test" }],
+        session_id: "test-thinking-budget",
+        thinking: { enabled: true, budget_tokens: 2048 },
+      }),
+    });
+    expect(res.status).toBe(200);
+    await res.text();
+
+    const upstream = openRouterChatBodies.at(-1);
+    expect(upstream).toBeTruthy();
+    // OpenRouter maps reasoning.effort across model families; keep thinking
+    // uniformly maximal even when old clients still send a token budget.
+    expect(upstream?.reasoning).toEqual({ effort: "xhigh" });
+    expect(upstream?.provider).toEqual({ require_parameters: true });
+    expect(upstream?.max_tokens).toBe(32000);
+  });
+
+  test("POST /api/chat maps Gemini 3 thinking budgets to reasoning effort", async () => {
+    openRouterChatBodies.length = 0;
+
+    const res = await fetch(`${BASE_URL}/api/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "google/gemini-3.1-pro-preview",
+        system: "",
+        messages: [{ role: "user", content: "Gemini thinking test" }],
+        session_id: "test-gemini-thinking",
+        thinking: { enabled: true, budget_tokens: 10_000 },
+      }),
+    });
+    expect(res.status).toBe(200);
+    await res.text();
+
+    const upstream = openRouterChatBodies.at(-1);
+    expect(upstream).toBeTruthy();
+    expect(upstream?.reasoning).toEqual({ effort: "xhigh" });
+    expect(upstream?.provider).toEqual({ require_parameters: true });
+    expect(upstream?.max_tokens).toBe(32000);
+  });
+
+  test("POST /api/chat sends no reasoning config when thinking is off", async () => {
+    const model = await getAnyModel();
+    openRouterChatBodies.length = 0;
+
+    const res = await fetch(`${BASE_URL}/api/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model,
+        system: "",
+        messages: [{ role: "user", content: "No thinking" }],
+        session_id: "test-no-thinking",
+      }),
+    });
+    expect(res.status).toBe(200);
+    await res.text();
+
+    const upstream = openRouterChatBodies.at(-1);
+    expect(upstream).toBeTruthy();
+    expect(upstream?.reasoning).toBeUndefined();
+    expect(upstream?.provider).toBeUndefined();
+    expect(upstream?.max_tokens).toBe(8192);
   });
 
   test("POST /api/chat returns 400 for missing model", async () => {
