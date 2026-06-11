@@ -270,6 +270,10 @@ interface ModelCatalogEntry {
   pricing?: {
     prompt?: string;
     completion?: string;
+    input_cache_read?: string;
+    input_cache_write?: string;
+    cache_read?: string;
+    cache_write?: string;
   };
 }
 
@@ -474,7 +478,10 @@ function normalizeUsage(raw: Record<string, unknown> | undefined): ChatLog["usag
   const completionTokens = num(raw?.completion_tokens) ?? num(raw?.output_tokens) ?? 0;
   const details = (raw?.prompt_tokens_details ?? {}) as Record<string, unknown>;
   const cacheReadTokens = num(details.cached_tokens) ?? num(raw?.cache_read_input_tokens);
-  const cacheCreationTokens = num(raw?.cache_creation_input_tokens);
+  const cacheCreationTokens =
+    num(details.cache_write_tokens) ??
+    num(raw?.cache_creation_input_tokens) ??
+    num(raw?.cache_write_input_tokens);
 
   return {
     input_tokens: promptTokens,
@@ -521,6 +528,11 @@ function extractThinkingDelta(delta: Record<string, unknown> | undefined): strin
   }
 
   return "";
+}
+
+function priceString(pricing: Record<string, unknown>, key: string): string | undefined {
+  const value = pricing[key];
+  return typeof value === "string" ? value : undefined;
 }
 
 function normalizeSearchTerm(value: string): string {
@@ -605,12 +617,12 @@ function normalizeModelEntries(rawModels: Array<Record<string, unknown>>): Model
         : undefined,
       pricing: m.pricing && typeof m.pricing === "object"
         ? {
-            prompt: typeof (m.pricing as Record<string, unknown>).prompt === "string"
-              ? (m.pricing as Record<string, unknown>).prompt as string
-              : undefined,
-            completion: typeof (m.pricing as Record<string, unknown>).completion === "string"
-              ? (m.pricing as Record<string, unknown>).completion as string
-              : undefined,
+            prompt: priceString(m.pricing as Record<string, unknown>, "prompt"),
+            completion: priceString(m.pricing as Record<string, unknown>, "completion"),
+            input_cache_read: priceString(m.pricing as Record<string, unknown>, "input_cache_read"),
+            input_cache_write: priceString(m.pricing as Record<string, unknown>, "input_cache_write"),
+            cache_read: priceString(m.pricing as Record<string, unknown>, "cache_read"),
+            cache_write: priceString(m.pricing as Record<string, unknown>, "cache_write"),
           }
         : undefined,
     }))
@@ -1018,6 +1030,11 @@ function isAbortLikeError(error: unknown): boolean {
   return error.name === "AbortError" || error.message.toLowerCase().includes("abort");
 }
 
+function reasoningConfigForThinking(thinking: ChatRequest["thinking"]): Record<string, unknown> | undefined {
+  if (thinking?.enabled !== true) return undefined;
+  return { effort: "xhigh" };
+}
+
 async function handleStream(req: Request, ctx: RequestContext): Promise<Response> {
   let body: unknown;
   try { body = await req.json(); } catch {
@@ -1090,14 +1107,20 @@ async function handleStream(req: Request, ctx: RequestContext): Promise<Response
   }
 
   const maxTokens = thinkingRequested && thinkingSupported ? 32000 : 8192;
+  const reasoningConfig = thinkingRequested && thinkingSupported
+    ? reasoningConfigForThinking(thinking)
+    : undefined;
   const modelParameters: Record<string, unknown> = {
     stream: true,
     max_tokens: maxTokens,
     thinking_enabled: thinkingRequested && thinkingSupported,
     thinking_budget: thinking?.budget_tokens,
   };
-  if (thinkingRequested && thinkingSupported) {
-    modelParameters.reasoning_effort = "high";
+  if (reasoningConfig?.effort) {
+    modelParameters.reasoning_effort = reasoningConfig.effort;
+  }
+  if (reasoningConfig?.max_tokens) {
+    modelParameters.reasoning_max_tokens = reasoningConfig.max_tokens;
   }
 
   const requestBody: Record<string, unknown> = {
@@ -1108,8 +1131,9 @@ async function handleStream(req: Request, ctx: RequestContext): Promise<Response
     max_tokens: maxTokens,
     user: session_id,
   };
-  if (thinkingRequested && thinkingSupported) {
-    requestBody.reasoning = { effort: "high" };
+  if (reasoningConfig) {
+    requestBody.reasoning = reasoningConfig;
+    requestBody.provider = { require_parameters: true };
   }
 
   const upstreamAbortController = new AbortController();

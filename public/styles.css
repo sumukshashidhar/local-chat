@@ -521,6 +521,14 @@ main {
 
 /* ── Edit Mode ───────────────────────────────────────────────────────────── */
 
+.edit-wrap {
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-md);
+  padding: 10px 12px;
+  box-shadow: 0 0 0 3px var(--accent-ring);
+  background: var(--surface);
+}
+
 .edit-textarea {
   width: 100%;
   min-height: 40px;
@@ -535,6 +543,41 @@ main {
   outline: none;
   caret-color: var(--accent);
 }
+
+.edit-controls {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.edit-cancel,
+.edit-save {
+  padding: 6px 12px;
+  border-radius: var(--radius-sm);
+  font-family: var(--font-body);
+  font-size: 12.5px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background var(--fast), color var(--fast), border-color var(--fast);
+}
+
+.edit-cancel {
+  background: transparent;
+  color: var(--text-secondary);
+  border: 1px solid var(--border-solid);
+}
+
+.edit-cancel:hover { background: var(--surface-hover); color: var(--text); }
+
+.edit-save {
+  background: var(--primary);
+  color: var(--on-primary);
+  border: none;
+  font-weight: 600;
+}
+
+.edit-save:hover { background: var(--primary-hover); }
 
 /* ── Message Typography ──────────────────────────────────────────────────── */
 
@@ -647,6 +690,50 @@ main {
 
 .error-text { color: var(--danger); }
 
+/* ── Stream-error affordances ────────────────────────────────────────────── */
+
+.message-error,
+.error-card {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 14px;
+  margin: 10px 0 0;
+  border: 1px solid color-mix(in srgb, var(--danger) 35%, transparent);
+  background: color-mix(in srgb, var(--danger) 6%, transparent);
+  border-radius: var(--radius-md);
+  color: var(--danger);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.error-card { margin: 12px 0; }
+
+.message-error span,
+.error-card span {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.message-error button,
+.error-card button {
+  flex-shrink: 0;
+  padding: 5px 12px;
+  background: var(--danger);
+  color: #fff;
+  border: none;
+  border-radius: var(--radius-sm);
+  font-family: var(--font-body);
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background var(--fast);
+}
+
+.message-error button:hover,
+.error-card button:hover { background: var(--danger-hover); }
+
 /* ── Per-message usage / cost / latency readout ──────────────────────────── */
 
 .message-meta {
@@ -715,11 +802,20 @@ main {
 
 .loading-indicator {
   display: flex;
+  align-items: center;
   gap: 5px;
   padding: 5px 0;
 }
 
-.loading-indicator span {
+.loading-elapsed {
+  margin-left: 8px;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.loading-indicator span:not(.loading-elapsed) {
   width: 6px;
   height: 6px;
   background: var(--text-dim);

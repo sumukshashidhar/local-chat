@@ -321,7 +321,7 @@ function createMessageElement(role, content, index, animate = true) {
   if (role === "user") {
     actionsDiv.innerHTML = `
       <button class="action-btn edit-btn" title="Edit">&#9998;</button>
-      <button class="action-btn delete-btn" title="Delete">&times;</button>
+      <button class="action-btn delete-btn" title="Delete from here">&times;</button>
     `;
   } else {
     actionsDiv.innerHTML = `
@@ -429,6 +429,8 @@ messagesEl.addEventListener("click", async (e) => {
 });
 
 function startEdit(messageEl, index, isAssistant = false) {
+  if (messageEl.querySelector(".edit-textarea")) return;
+
   const contentDiv = messageEl.querySelector(".message-content");
   const actionsDiv = messageEl.querySelector(".message-actions");
   const originalContent = state.messages[index].content;
@@ -437,11 +439,27 @@ function startEdit(messageEl, index, isAssistant = false) {
   actionsDiv.style.opacity = "0";
   actionsDiv.style.pointerEvents = "none";
 
-  // Create textarea
+  const editWrap = document.createElement("div");
+  editWrap.className = "edit-wrap";
+
   const textarea = document.createElement("textarea");
   textarea.className = "edit-textarea";
   textarea.value = originalContent;
-  contentDiv.replaceWith(textarea);
+
+  const controls = document.createElement("div");
+  controls.className = "edit-controls";
+  const cancelBtn = document.createElement("button");
+  cancelBtn.type = "button";
+  cancelBtn.className = "edit-cancel";
+  cancelBtn.textContent = "Cancel";
+  const saveBtn = document.createElement("button");
+  saveBtn.type = "button";
+  saveBtn.className = "edit-save";
+  saveBtn.textContent = isAssistant ? "Save" : "Save & regenerate";
+  controls.append(cancelBtn, saveBtn);
+
+  editWrap.append(textarea, controls);
+  contentDiv.replaceWith(editWrap);
 
   // Size and focus in next frame to avoid layout thrash
   requestAnimationFrame(() => {
@@ -450,32 +468,49 @@ function startEdit(messageEl, index, isAssistant = false) {
     textarea.setSelectionRange(textarea.value.length, textarea.value.length);
   });
 
+  textarea.addEventListener("input", () => {
+    textarea.style.height = "auto";
+    textarea.style.height = textarea.scrollHeight + "px";
+  });
+
   let finished = false;
-  const finishEdit = (save) => {
+  const finishEdit = async (save) => {
     if (finished) return;
     finished = true;
 
-    // Editing only updates the message in place. It never regenerates or
-    // truncates the rest of the conversation — use Retry to regenerate from
-    // a turn, or Continue to extend an assistant reply.
+    let changed = false;
     if (save) {
       const newContent = textarea.value.trim();
       if (newContent && newContent !== originalContent) {
         state.messages[index].content = newContent;
+        changed = true;
       }
     }
 
-    // Restore message in-place
-    const role = isAssistant ? "assistant" : "user";
-    const replacement = createMessageElement(
-      role,
-      state.messages[index].content,
-      index,
-      false
+    // Restore only the content div so the usage meta, thinking section and
+    // action buttons survive the edit.
+    const restored = document.createElement("div");
+    restored.className = "message-content";
+    const content = state.messages[index].content;
+    restored.innerHTML = formatContent(
+      isAssistant ? cleanAssistantContent(content).trim() : content,
     );
-    messageEl.replaceWith(replacement);
+    editWrap.replaceWith(restored);
+    actionsDiv.style.opacity = "";
+    actionsDiv.style.pointerEvents = "";
 
     triggerAutoSave();
+
+    // Saving an edited user message regenerates the conversation from that
+    // point. Assistant edits only rewrite the text in place.
+    if (changed && !isAssistant) {
+      if (state.isStreaming) {
+        showToast("Saved. Stop the current response to regenerate.", "info", 3500);
+        return;
+      }
+      removeMessagesFrom(index + 1);
+      await streamResponse();
+    }
   };
 
   textarea.addEventListener("keydown", (e) => {
@@ -487,7 +522,57 @@ function startEdit(messageEl, index, isAssistant = false) {
     }
   });
 
-  textarea.addEventListener("blur", () => finishEdit(true));
+  cancelBtn.addEventListener("click", () => finishEdit(false));
+  saveBtn.addEventListener("click", () => finishEdit(true));
+}
+
+// ── Stream-error affordances ──
+
+// Inline note on an assistant message that errored after partial content.
+function appendErrorNote(assistantEl, message) {
+  const note = document.createElement("div");
+  note.className = "message-error";
+  const text = document.createElement("span");
+  text.textContent = `Interrupted: ${message}`;
+  const retry = document.createElement("button");
+  retry.type = "button";
+  retry.textContent = "Retry";
+  retry.addEventListener("click", async () => {
+    if (state.isStreaming) return;
+    const idx = parseInt(assistantEl.dataset.index, 10);
+    removeMessagesFrom(idx);
+    await streamResponse();
+  });
+  note.append(text, retry);
+  const actions = assistantEl.querySelector(".message-actions");
+  if (actions) assistantEl.insertBefore(note, actions);
+  else assistantEl.appendChild(note);
+}
+
+// Standalone card when a request failed before any content streamed. Not a
+// .message — it has no backing state entry, so it must stay out of the
+// DOM/state index mapping.
+function appendErrorCard(message) {
+  clearErrorCards();
+  const card = document.createElement("div");
+  card.className = "error-card";
+  const text = document.createElement("span");
+  text.textContent = message;
+  const retry = document.createElement("button");
+  retry.type = "button";
+  retry.textContent = "Retry";
+  retry.addEventListener("click", async () => {
+    if (state.isStreaming) return;
+    card.remove();
+    await streamResponse();
+  });
+  card.append(text, retry);
+  messagesEl.appendChild(card);
+  scrollToBottom(true);
+}
+
+function clearErrorCards() {
+  messagesEl.querySelectorAll(".error-card").forEach((el) => el.remove());
 }
 
 function setSendButtonMode(mode) {
@@ -523,10 +608,44 @@ function modelPricing(modelId) {
   const prompt = parseFloat(model.pricing.prompt);
   const completion = parseFloat(model.pricing.completion);
   if (!isFinite(prompt) && !isFinite(completion)) return null;
+
+  const promptRate = isFinite(prompt) ? prompt : 0;
+  const provider = (modelId.split("/")[0] || "").toLowerCase();
+  const cachedReadFallback =
+    provider === "anthropic" || provider === "qwen" || provider === "deepseek"
+      ? promptRate * 0.1
+      : provider === "groq"
+        ? promptRate * 0.5
+        : promptRate * 0.25;
+  const cachedWriteFallback =
+    provider === "anthropic"
+      ? promptRate * 2
+      : provider === "qwen"
+        ? promptRate * 1.25
+        : promptRate;
+  const cacheRead = firstFinitePrice(model.pricing, [
+    "input_cache_read",
+    "cache_read",
+  ]);
+  const cacheWrite = firstFinitePrice(model.pricing, [
+    "input_cache_write",
+    "cache_write",
+  ]);
+
   return {
-    prompt: isFinite(prompt) ? prompt : 0,
+    prompt: promptRate,
     completion: isFinite(completion) ? completion : 0,
+    cacheRead: isFinite(cacheRead) ? cacheRead : cachedReadFallback,
+    cacheWrite: isFinite(cacheWrite) ? cacheWrite : cachedWriteFallback,
   };
+}
+
+function firstFinitePrice(pricing, keys) {
+  for (const key of keys) {
+    const value = parseFloat(pricing[key]);
+    if (isFinite(value)) return value;
+  }
+  return NaN;
 }
 
 function estimateCost(usage, modelId) {
@@ -536,12 +655,15 @@ function estimateCost(usage, modelId) {
   const output = Number(usage.output_tokens) || 0;
   const cacheRead = Number(usage.cache_read_input_tokens) || 0;
   const cacheWrite = Number(usage.cache_creation_input_tokens) || 0;
-  // Estimate: cached reads bill ~0.1x and cache writes ~1.25x the input rate.
+  const billableCacheRead = Math.min(input, cacheRead);
+  const billableCacheWrite = Math.min(Math.max(0, input - billableCacheRead), cacheWrite);
+  const uncachedInput = Math.max(0, input - billableCacheRead - billableCacheWrite);
+
   return (
-    input * pricing.prompt +
+    uncachedInput * pricing.prompt +
     output * pricing.completion +
-    cacheRead * pricing.prompt * 0.1 +
-    cacheWrite * pricing.prompt * 1.25
+    billableCacheRead * pricing.cacheRead +
+    billableCacheWrite * pricing.cacheWrite
   );
 }
 
@@ -566,9 +688,11 @@ function renderUsageMeta(assistantEl, usage, latency, modelId) {
   const input = Number(usage.input_tokens);
   const output = Number(usage.output_tokens);
   const cacheRead = Number(usage.cache_read_input_tokens) || 0;
+  const cacheWrite = Number(usage.cache_creation_input_tokens) || 0;
   if (isFinite(input)) parts.push(`${input.toLocaleString()} in`);
   if (isFinite(output)) parts.push(`${output.toLocaleString()} out`);
   if (cacheRead > 0) parts.push(`${cacheRead.toLocaleString()} cached`);
+  if (cacheWrite > 0) parts.push(`${cacheWrite.toLocaleString()} cache write`);
 
   const costStr = formatCost(estimateCost(usage, modelId));
   if (costStr) parts.push(costStr);
@@ -592,7 +716,7 @@ function renderUsageMeta(assistantEl, usage, latency, modelId) {
   }
   meta.textContent = parts.join("  ·  ");
   meta.title =
-    "Estimated from model pricing · 'cached' = prompt-cache read tokens";
+    "Estimated after prompt-cache discounts · 'cached' = prompt-cache read tokens";
 }
 
 // ── Streaming (rAF-batched) ──
@@ -607,6 +731,7 @@ async function streamResponse(opts = {}) {
   shouldAutoScroll = true;
 
   clearEmptyState();
+  clearErrorCards();
 
   let index;
   let assistantEl;
@@ -614,6 +739,8 @@ async function streamResponse(opts = {}) {
   let thinkingSection = null;
   let thinkingContentDiv = null;
   let loadingDiv = null;
+  let elapsedEl = null;
+  let elapsedTimer = null;
   let seedContent = "";
 
   if (continueMode) {
@@ -655,10 +782,14 @@ async function streamResponse(opts = {}) {
     contentDiv.className = "message-content";
     assistantEl.appendChild(contentDiv);
 
-    // Loading indicator
+    // Loading indicator with an elapsed-time readout so long prompt
+    // processing / reasoning phases don't look like a hang.
     loadingDiv = document.createElement("div");
     loadingDiv.className = "loading-indicator";
     loadingDiv.innerHTML = "<span></span><span></span><span></span>";
+    elapsedEl = document.createElement("span");
+    elapsedEl.className = "loading-elapsed";
+    loadingDiv.appendChild(elapsedEl);
     contentDiv.appendChild(loadingDiv);
 
     // Actions (will be usable after streaming)
@@ -684,6 +815,45 @@ async function streamResponse(opts = {}) {
   let finalUsage = null;
   let finalLatency = null;
 
+  const streamStartedAt = performance.now();
+  if (elapsedEl) {
+    elapsedTimer = setInterval(() => {
+      if (!elapsedEl) return;
+      const secs = Math.round((performance.now() - streamStartedAt) / 1000);
+      if (secs >= 2) elapsedEl.textContent = `${secs}s`;
+    }, 1000);
+  }
+
+  function stopElapsedTimer() {
+    if (elapsedTimer) {
+      clearInterval(elapsedTimer);
+      elapsedTimer = null;
+    }
+    elapsedEl = null;
+  }
+
+  // The server forwards reasoning deltas even when the Think toggle is off
+  // (some models reason by default), so create the section on demand instead
+  // of dropping that stream on the floor.
+  function ensureThinkingSection() {
+    if (thinkingContentDiv) return;
+    const existing = assistantEl.querySelector(".thinking-section");
+    if (existing) {
+      thinkingSection = existing;
+      thinkingContentDiv = existing.querySelector(".thinking-content");
+      return;
+    }
+    thinkingSection = document.createElement("details");
+    thinkingSection.className = "thinking-section";
+    thinkingSection.open = true;
+    thinkingSection.innerHTML = `
+      <summary>Thinking<span class="thinking-indicator"></span></summary>
+      <div class="thinking-content"></div>
+    `;
+    thinkingContentDiv = thinkingSection.querySelector(".thinking-content");
+    assistantEl.insertBefore(thinkingSection, contentDiv);
+  }
+
   // rAF batching — at most one DOM update per frame
   let dirty = false;
   let rafId = null;
@@ -704,6 +874,7 @@ async function streamResponse(opts = {}) {
     if (loadingDiv && !loadingRemoved && (renderedContent || streamDone)) {
       loadingDiv.remove();
       loadingRemoved = true;
+      stopElapsedTimer();
     }
 
     contentDiv.innerHTML = formatContent(renderedContent);
@@ -728,11 +899,13 @@ async function streamResponse(opts = {}) {
     if (loadingDiv && !loadingRemoved) {
       loadingDiv.remove();
       loadingRemoved = true;
+      stopElapsedTimer();
     }
 
     contentDiv.innerHTML = formatContent(renderedContent);
 
-    if (thinkingContentDiv && fullThinking) {
+    if (fullThinking) {
+      ensureThinkingSection();
       thinkingContentDiv.innerHTML = formatContent(fullThinking);
     }
 
@@ -764,7 +937,7 @@ async function streamResponse(opts = {}) {
         messages: state.messages,
         session_id: state.sessionId,
         thinking: !continueMode && state.thinkingEnabled && supportsThinking
-          ? { enabled: true, budget_tokens: 10000 }
+          ? { enabled: true }
           : undefined,
       }),
     });
@@ -794,6 +967,7 @@ async function streamResponse(opts = {}) {
 
           if (data.type === "thinking_delta") {
             fullThinking += data.thinking;
+            ensureThinkingSection();
             scheduleRender();
           } else if (data.type === "delta") {
             fullContent += data.text;
@@ -873,13 +1047,27 @@ async function streamResponse(opts = {}) {
         5000,
       );
     } else {
-      // Remove dangling assistant element (no backing state entry)
-      assistantEl.remove();
-      if (state.messages.length === 0) showEmptyState();
+      const renderedContent = renderFinalContent();
+      const errMsg = errorMessage(error, "Failed to get response");
       logError("Failed to get response", error);
-      showToast(errorMessage(error, "Failed to get response"), "error", 5000);
+
+      if (renderedContent) {
+        // Keep whatever streamed before the error; the inline Retry (or the
+        // message's own retry action) regenerates from this turn.
+        state.messages.push({ role: "assistant", content: fullContent });
+        assistantEl.classList.add("errored");
+        appendErrorNote(assistantEl, errMsg);
+      } else {
+        // Nothing streamed — drop the placeholder (no backing state entry)
+        // and leave a retry card instead of a dead end.
+        assistantEl.remove();
+        appendErrorCard(errMsg);
+        if (state.messages.length === 0) showEmptyState();
+      }
+      showToast(errMsg, "error", 5000);
     }
   } finally {
+    stopElapsedTimer();
     if (rafId) {
       cancelAnimationFrame(rafId);
       dirty = false;
