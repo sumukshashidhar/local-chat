@@ -173,9 +173,12 @@ function showToast(message, type = "info", duration = 3000) {
 // ── Content Formatting ──
 
 function escapeHtml(text) {
-  const div = document.createElement("div");
-  div.textContent = text;
-  return div.innerHTML;
+  return String(text)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
 
 function escapeAttribute(text) {
@@ -274,6 +277,70 @@ function formatContent(text) {
   return s;
 }
 
+const ALLOWED_FORMAT_TAGS = new Set([
+  "a",
+  "br",
+  "code",
+  "del",
+  "em",
+  "h2",
+  "h3",
+  "h4",
+  "hr",
+  "li",
+  "p",
+  "pre",
+  "strong",
+  "ul",
+]);
+
+function sanitizeFormattedNode(node) {
+  if (node.nodeType === Node.TEXT_NODE) {
+    return document.createTextNode(node.textContent || "");
+  }
+  if (node.nodeType !== Node.ELEMENT_NODE) {
+    return null;
+  }
+
+  const tag = node.tagName.toLowerCase();
+  if (!ALLOWED_FORMAT_TAGS.has(tag)) {
+    const fragment = document.createDocumentFragment();
+    node.childNodes.forEach((child) => {
+      const sanitized = sanitizeFormattedNode(child);
+      if (sanitized) fragment.appendChild(sanitized);
+    });
+    return fragment;
+  }
+
+  const element = document.createElement(tag);
+  if (tag === "a") {
+    element.setAttribute("href", safeHref(node.getAttribute("href") || ""));
+    element.setAttribute("target", "_blank");
+    element.setAttribute("rel", "noopener");
+  }
+
+  node.childNodes.forEach((child) => {
+    const sanitized = sanitizeFormattedNode(child);
+    if (sanitized) element.appendChild(sanitized);
+  });
+
+  return element;
+}
+
+function formattedContentFragment(text) {
+  const parsed = new DOMParser().parseFromString(formatContent(text), "text/html");
+  const fragment = document.createDocumentFragment();
+  parsed.body.childNodes.forEach((child) => {
+    const sanitized = sanitizeFormattedNode(child);
+    if (sanitized) fragment.appendChild(sanitized);
+  });
+  return fragment;
+}
+
+function setFormattedContent(element, text) {
+  element.replaceChildren(formattedContentFragment(text));
+}
+
 function cleanAssistantContent(text) {
   if (typeof text !== "string") return "";
   return text.replace(/<\/?response>/gi, "");
@@ -308,9 +375,9 @@ function createMessageElement(role, content, index, animate = true) {
   contentDiv.className = "message-content";
 
   if (role === "assistant") {
-    contentDiv.innerHTML = formatContent(cleanAssistantContent(content).trim());
+    setFormattedContent(contentDiv, cleanAssistantContent(content).trim());
   } else {
-    contentDiv.innerHTML = formatContent(content);
+    setFormattedContent(contentDiv, content);
   }
 
   div.appendChild(contentDiv);
@@ -492,9 +559,7 @@ function startEdit(messageEl, index, isAssistant = false) {
     const restored = document.createElement("div");
     restored.className = "message-content";
     const content = state.messages[index].content;
-    restored.innerHTML = formatContent(
-      isAssistant ? cleanAssistantContent(content).trim() : content,
-    );
+    setFormattedContent(restored, isAssistant ? cleanAssistantContent(content).trim() : content);
     editWrap.replaceWith(restored);
     actionsDiv.style.opacity = "";
     actionsDiv.style.pointerEvents = "";
@@ -877,10 +942,10 @@ async function streamResponse(opts = {}) {
       stopElapsedTimer();
     }
 
-    contentDiv.innerHTML = formatContent(renderedContent);
+    setFormattedContent(contentDiv, renderedContent);
 
     if (thinkingContentDiv && fullThinking) {
-      thinkingContentDiv.innerHTML = formatContent(fullThinking);
+      setFormattedContent(thinkingContentDiv, fullThinking);
     }
 
     if (shouldAutoScroll) {
@@ -902,11 +967,11 @@ async function streamResponse(opts = {}) {
       stopElapsedTimer();
     }
 
-    contentDiv.innerHTML = formatContent(renderedContent);
+    setFormattedContent(contentDiv, renderedContent);
 
     if (fullThinking) {
       ensureThinkingSection();
-      thinkingContentDiv.innerHTML = formatContent(fullThinking);
+      setFormattedContent(thinkingContentDiv, fullThinking);
     }
 
     return renderedContent;
@@ -1039,7 +1104,7 @@ async function streamResponse(opts = {}) {
       // Continuation failed (e.g. the model rejects assistant prefill).
       // Restore the original reply untouched and surface the error.
       state.messages[index].content = seedContent;
-      contentDiv.innerHTML = formatContent(cleanAssistantContent(seedContent).trim());
+      setFormattedContent(contentDiv, cleanAssistantContent(seedContent).trim());
       logError("Failed to continue response", error);
       showToast(
         errorMessage(error, "This model can't continue an assistant message"),
