@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { langfuseUsageDetails } from "./langfuse";
 
 let BASE_URL = process.env.TEST_BASE_URL || "";
 let appProcess: ReturnType<typeof Bun.spawn> | null = null;
@@ -10,7 +11,7 @@ let mockLangfuse: ReturnType<typeof Bun.serve> | null = null;
 let testRoot = "";
 let testLogsDir = "";
 let mockOpenRouterCancelCount = 0;
-const langfuseBatches: Array<{ auth: string | null; body: Record<string, unknown> }> = [];
+const langfuseExports: Array<{ auth: string | null; contentType: string | null; body: Uint8Array; searchableText: string; json: Record<string, unknown> }> = [];
 const openRouterChatBodies: Array<Record<string, unknown>> = [];
 
 function randomPort(): number {
@@ -127,26 +128,20 @@ function startMockLangfuse(): ReturnType<typeof Bun.serve> {
     port: 0,
     async fetch(req) {
       const url = new URL(req.url);
-      if (url.pathname !== "/api/public/ingestion") {
+      if (url.pathname !== "/api/public/otel/v1/traces") {
         return new Response("Not found", { status: 404 });
       }
 
-      const body = await req.json() as Record<string, unknown>;
-      langfuseBatches.push({
+      const body = new Uint8Array(await req.arrayBuffer());
+      const searchableText = new TextDecoder().decode(body);
+      langfuseExports.push({
         auth: req.headers.get("authorization"),
+        contentType: req.headers.get("content-type"),
         body,
+        searchableText,
+        json: JSON.parse(searchableText) as Record<string, unknown>,
       });
-      const batch = Array.isArray(body.batch) ? body.batch : [];
-      return Response.json(
-        {
-          successes: batch.map((event) => ({
-            id: (event as Record<string, unknown>).id,
-            status: 201,
-          })),
-          errors: [],
-        },
-        { status: 207 },
-      );
+      return Response.json({});
     },
   });
 }
@@ -264,6 +259,16 @@ afterAll(async () => {
 });
 
 describe("Chat API", () => {
+  test("Langfuse usage details use mutually exclusive cache buckets", () => {
+    expect(langfuseUsageDetails({ input_tokens: 12, output_tokens: 1, cache_read_input_tokens: 4, cache_creation_input_tokens: 2 })).toEqual({
+      input: 6,
+      output: 1,
+      total: 13,
+      cache_read_input_tokens: 4,
+      cache_creation_input_tokens: 2,
+    });
+  });
+
   test("GET /api/models returns OpenRouter model catalog", async () => {
     const res = await fetch(`${BASE_URL}/api/models`);
     const data = await res.json();
@@ -314,7 +319,7 @@ describe("Chat API", () => {
   });
 
   test("POST /api/chat streams response and writes a structured chat log", async () => {
-    langfuseBatches.length = 0;
+    langfuseExports.length = 0;
     const model = await getAnyModel();
     const res = await fetch(`${BASE_URL}/api/chat`, {
       method: "POST",
@@ -385,20 +390,17 @@ describe("Chat API", () => {
       expect(lastLog.usage.cache_creation_input_tokens).toBe(2);
     }
 
-    await waitForCondition(() => langfuseBatches.length > 0, "LangFuse ingestion");
-    const lastBatch = langfuseBatches.at(-1);
-    expect(lastBatch?.auth).toBe(`Basic ${btoa("pk-test:sk-test")}`);
-    const batch = lastBatch?.body.batch;
-    expect(Array.isArray(batch)).toBe(true);
-    const events = batch as Array<{ type: string; body: Record<string, unknown> }>;
-    const traceEvent = events.find((event) => event.type === "trace-create");
-    const generationEvent = events.find((event) => event.type === "generation-create");
-    expect(traceEvent?.body.sessionId).toBe("test-session-123");
-    expect(generationEvent?.body.model).toBe(model);
-    expect(generationEvent?.body.output).toBe("OK");
-    expect((generationEvent?.body.usageDetails as Record<string, number>).input).toBe(12);
-    expect((generationEvent?.body.usageDetails as Record<string, number>).output).toBe(1);
-    expect((generationEvent?.body.usageDetails as Record<string, number>).cache_creation_input_tokens).toBe(2);
+    await waitForCondition(() => langfuseExports.length > 0, "Langfuse OTLP export");
+    const lastExport = langfuseExports.at(-1);
+    expect(lastExport?.auth).toBe(`Basic ${btoa("pk-test:sk-test")}`);
+    expect(lastExport?.contentType).toContain("application/json");
+    expect(lastExport?.body.byteLength).toBeGreaterThan(0);
+    expect(Array.isArray(lastExport?.json.resourceSpans)).toBe(true);
+    expect(lastExport?.searchableText).toContain("chat.request");
+    expect(lastExport?.searchableText).toContain("openrouter.chat.completions");
+    expect(lastExport?.searchableText).toContain("test-session-123");
+    expect(lastExport?.searchableText).toContain(model);
+    expect(lastExport?.searchableText).toContain("cache_creation_input_tokens");
   });
 
   test("POST /api/chat accepts a conversation ending with an assistant turn (continuation)", async () => {

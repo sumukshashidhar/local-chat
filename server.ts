@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { appendFile, mkdir, readdir, rename, unlink, writeFile } from "node:fs/promises";
 import { dirname, extname, resolve, sep } from "node:path";
+import { LangfuseTracing } from "./langfuse";
 
 // ── Config ──────────────────────────────────────────────────────────────────
 
@@ -102,6 +103,7 @@ const LANGFUSE_PUBLIC_KEY = process.env.LANGFUSE_PUBLIC_KEY || "";
 const LANGFUSE_SECRET_KEY = process.env.LANGFUSE_SECRET_KEY || "";
 const LANGFUSE_BASE_URL = (process.env.LANGFUSE_BASE_URL || "https://cloud.langfuse.com").replace(/\/+$/, "");
 const LANGFUSE_REQUEST_TIMEOUT_MS = 4_000;
+const LANGFUSE_ENVIRONMENT = process.env.LANGFUSE_TRACING_ENVIRONMENT || "development";
 const OPENROUTER_CONNECT_TIMEOUT_MS = parsePositiveInteger(process.env.OPENROUTER_CONNECT_TIMEOUT_MS, 60_000);
 const OPENROUTER_STREAM_IDLE_TIMEOUT_MS = parsePositiveInteger(process.env.OPENROUTER_STREAM_IDLE_TIMEOUT_MS, 60_000);
 const MODEL_CACHE_TTL_MS = 5 * 60 * 1000;
@@ -188,6 +190,16 @@ const logger = {
   error: (event: string, context?: LogContext) => writeLog("error", event, context),
 };
 
+const langfuse = new LangfuseTracing({
+  enabled: LANGFUSE_ENABLED,
+  publicKey: LANGFUSE_PUBLIC_KEY,
+  secretKey: LANGFUSE_SECRET_KEY,
+  baseUrl: LANGFUSE_BASE_URL,
+  requestTimeoutMs: LANGFUSE_REQUEST_TIMEOUT_MS,
+  environment: LANGFUSE_ENVIRONMENT,
+  logger,
+});
+
 const openRouterApiKey = process.env.OPENROUTER_API_KEY;
 if (!openRouterApiKey) {
   logger.error("startup.missing_openrouter_api_key", {
@@ -259,15 +271,6 @@ interface ChatLog {
   error?: string;
 }
 
-interface LangfuseInferenceEvent {
-  log: ChatLog;
-  startTime: Date;
-  endTime: Date;
-  completionStartTime?: Date;
-  requestedModel: string;
-  modelParameters: Record<string, unknown>;
-}
-
 interface ModelCatalogEntry {
   id: string;
   name: string;
@@ -297,169 +300,8 @@ let themeCatalogCache:
   | { fetchedAt: string; expiresAt: number; enabled: boolean; themes: ThemeCatalogEntry[] }
   | null = null;
 
-// ── LangFuse ───────────────────────────────────────────────────────────────
-
-function langfuseConfigured(): boolean {
-  return LANGFUSE_ENABLED && Boolean(LANGFUSE_PUBLIC_KEY && LANGFUSE_SECRET_KEY);
-}
-
-function langfuseIngestionUrl(): string {
-  if (LANGFUSE_BASE_URL.endsWith("/api/public/ingestion")) return LANGFUSE_BASE_URL;
-  if (LANGFUSE_BASE_URL.endsWith("/api/public")) return `${LANGFUSE_BASE_URL}/ingestion`;
-  return `${LANGFUSE_BASE_URL}/api/public/ingestion`;
-}
-
-function modelProvider(modelId: string): string {
-  const [provider] = modelId.split("/");
-  return provider || OPENROUTER_PROVIDER;
-}
-
 function dateFromPerfDelta(start: Date, deltaMs: number | null): Date | undefined {
   return deltaMs === null ? undefined : new Date(start.getTime() + Math.max(0, deltaMs));
-}
-
-function langfuseLevel(status: ChatLog["status"]): "DEFAULT" | "WARNING" | "ERROR" {
-  if (status === "failed") return "ERROR";
-  if (status === "cancelled") return "WARNING";
-  return "DEFAULT";
-}
-
-function langfuseUsageDetails(usage: ChatLog["usage"]): Record<string, number> {
-  const details: Record<string, number> = {
-    input: usage.input_tokens,
-    output: usage.output_tokens,
-    total: usage.input_tokens + usage.output_tokens,
-  };
-  if (usage.cache_read_input_tokens !== undefined) {
-    details.cache_read_input_tokens = usage.cache_read_input_tokens;
-  }
-  if (usage.cache_creation_input_tokens !== undefined) {
-    details.cache_creation_input_tokens = usage.cache_creation_input_tokens;
-  }
-  return details;
-}
-
-async function sendLangfuseInference(event: LangfuseInferenceEvent): Promise<void> {
-  if (!langfuseConfigured()) return;
-
-  const { log, startTime, endTime, completionStartTime, requestedModel, modelParameters } = event;
-  const upstreamProvider = modelProvider(log.model);
-  const level = langfuseLevel(log.status);
-  const statusMessage = log.error || (log.status === "cancelled" ? "cancelled by client" : undefined);
-  const traceId = log.id;
-  const generationId = crypto.randomUUID();
-  const now = new Date().toISOString();
-  const metadata = cleanContext({
-    app: "local-chat",
-    request_id: log.request_id,
-    log_id: log.id,
-    provider: log.provider,
-    upstream_provider: upstreamProvider,
-    requested_model: requestedModel !== log.model ? requestedModel : undefined,
-    thinking_enabled: log.thinking_enabled,
-    thinking_budget: log.thinking_budget,
-    thinking_chars: log.thinking_content?.length,
-    status: log.status,
-  });
-  const input = {
-    system: log.system_prompt,
-    messages: log.messages,
-  };
-  const usageDetails = langfuseUsageDetails(log.usage);
-
-  const payload = {
-    batch: [
-      {
-        id: crypto.randomUUID(),
-        timestamp: now,
-        type: "trace-create",
-        body: {
-          id: traceId,
-          timestamp: startTime.toISOString(),
-          name: "local-chat",
-          input,
-          output: log.response || statusMessage || "",
-          sessionId: log.session_id,
-          metadata,
-          tags: ["local-chat", log.provider, upstreamProvider],
-        },
-      },
-      {
-        id: crypto.randomUUID(),
-        timestamp: now,
-        type: "generation-create",
-        body: {
-          id: generationId,
-          traceId,
-          name: "chat.completions",
-          startTime: startTime.toISOString(),
-          endTime: endTime.toISOString(),
-          completionStartTime: completionStartTime?.toISOString(),
-          model: log.model,
-          modelParameters: cleanContext(modelParameters),
-          input,
-          output: log.response,
-          usage: {
-            promptTokens: log.usage.input_tokens,
-            completionTokens: log.usage.output_tokens,
-            totalTokens: log.usage.input_tokens + log.usage.output_tokens,
-          },
-          usageDetails,
-          level,
-          statusMessage,
-          metadata,
-        },
-      },
-    ],
-    metadata: {
-      source: "local-chat",
-      sdk: "custom-ingestion",
-    },
-  };
-
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), LANGFUSE_REQUEST_TIMEOUT_MS);
-  try {
-    const res = await fetch(langfuseIngestionUrl(), {
-      method: "POST",
-      headers: {
-        Authorization: `Basic ${btoa(`${LANGFUSE_PUBLIC_KEY}:${LANGFUSE_SECRET_KEY}`)}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(payload),
-      signal: controller.signal,
-    });
-    const responseText = await res.text();
-    let parsed: { errors?: unknown[] } | null = null;
-    try {
-      parsed = responseText ? JSON.parse(responseText) as { errors?: unknown[] } : null;
-    } catch {
-      parsed = null;
-    }
-
-    if (!res.ok || (parsed?.errors && parsed.errors.length > 0)) {
-      logger.warn("langfuse.ingestion_failed", {
-        request_id: log.request_id,
-        status: res.status,
-        errors: parsed?.errors,
-        body: !parsed ? responseText.slice(0, 300) : undefined,
-      });
-      return;
-    }
-
-    logger.debug("langfuse.ingestion_written", {
-      request_id: log.request_id,
-      trace_id: traceId,
-      generation_id: generationId,
-    });
-  } catch (error) {
-    logger.warn("langfuse.ingestion_error", {
-      request_id: log.request_id,
-      error: errorDetails(error),
-    });
-  } finally {
-    clearTimeout(timeout);
-  }
 }
 
 // ── Response Helpers ────────────────────────────────────────────────────────
@@ -1156,7 +998,24 @@ async function handleStream(req: Request, ctx: RequestContext): Promise<Response
   if (reasoningConfig) {
     requestBody.reasoning = reasoningConfig;
     requestBody.provider = { require_parameters: true };
+    modelParameters.require_parameters = true;
   }
+
+  const langfuseTrace = langfuse.startChatTrace({
+    logId,
+    requestId: ctx.requestId,
+    sessionId: session_id,
+    provider: OPENROUTER_PROVIDER,
+    requestedModel,
+    model,
+    systemPrompt: system,
+    messages,
+    upstreamMessages: openRouterMessages,
+    modelParameters,
+    thinkingRequested,
+    thinkingEnabled: thinkingRequested && thinkingSupported,
+    startTime: streamStartTime,
+  });
 
   const upstreamAbortController = new AbortController();
   let upstreamReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
@@ -1284,6 +1143,17 @@ async function handleStream(req: Request, ctx: RequestContext): Promise<Response
       total_time_ms: Math.round(elapsed),
       time_to_first_thinking_ms: ttfThinking !== null ? Math.round(ttfThinking) : undefined,
     };
+    const endTime = new Date();
+    langfuseTrace?.finish({
+      status,
+      response: fullResponse,
+      thinking: fullThinking || undefined,
+      usage,
+      latency,
+      completionStartTime: dateFromPerfDelta(streamStartTime, ttft),
+      endTime,
+      error,
+    });
     const log: ChatLog = {
       id: logId,
       request_id: ctx.requestId,
@@ -1305,14 +1175,6 @@ async function handleStream(req: Request, ctx: RequestContext): Promise<Response
     };
 
     await writeChatLog(log);
-    void sendLangfuseInference({
-      log,
-      startTime: streamStartTime,
-      endTime: new Date(),
-      completionStartTime: dateFromPerfDelta(streamStartTime, ttft),
-      requestedModel,
-      modelParameters,
-    });
 
     return { log, usage, latency };
   }
@@ -1942,5 +1804,19 @@ logger.info("server.started", {
   logs_dir: LOGS_DIR,
   chats_dir: CHATS_DIR,
   openrouter_base_url: OPENROUTER_API_BASE,
-  langfuse_enabled: langfuseConfigured(),
+  langfuse_enabled: langfuse.enabled,
+  langfuse_environment: langfuse.enabled ? LANGFUSE_ENVIRONMENT : undefined,
 });
+
+let shuttingDown = false;
+async function shutdown(signal: string): Promise<void> {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  logger.info("server.stopping", { signal });
+  server.stop(true);
+  await langfuse.shutdown();
+  process.exit(0);
+}
+
+process.once("SIGINT", () => void shutdown("SIGINT"));
+process.once("SIGTERM", () => void shutdown("SIGTERM"));
