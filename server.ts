@@ -154,7 +154,7 @@ function parseInteraction(value: unknown):
 
   const positiveInt = (v: unknown): number | undefined => {
     const parsed = typeof v === "number" ? v : Number.parseInt(v as string, 10);
-    return Number.isFinite(parsed) && parsed > 0 && Number.isInteger(parsed)
+    return Number.isFinite(parsed) && parsed > 0 && Number.isInteger(parsed) && parsed < 1_000_000
       ? parsed
       : undefined;
   };
@@ -1241,35 +1241,44 @@ async function handleStream(req: Request, ctx: RequestContext): Promise<Response
   const sse = (obj: Record<string, unknown>) =>
     encoder.encode(`data: ${JSON.stringify(obj)}\n\n`);
 
-  async function persistStreamOutcome(
+  // A stream outcome is persisted exactly once. If the client disconnects
+  // right after the completed write (e.g. during the final done event), the
+  // resulting cancel must not append a second log entry for the same id.
+  let persistedOutcome: Promise<{ log: ChatLog; usage: ChatLog["usage"]; latency: ChatLog["latency"] }> | null = null;
+
+  function persistStreamOutcome(
     status: ChatLog["status"],
     error?: string,
   ): Promise<{ log: ChatLog; usage: ChatLog["usage"]; latency: ChatLog["latency"] }> {
-    const { usage, latency } = captureStreamOutcome(status, error);
-    const log: ChatLog = {
-      id: logId,
-      request_id: ctx.requestId,
-      status,
-      session_id,
-      timestamp: new Date().toISOString(),
-      provider: OPENROUTER_PROVIDER,
-      model,
-      requested_model: requestedModel !== model ? requestedModel : undefined,
-      system_prompt: system,
-      messages,
-      response: fullResponse,
-      thinking_content: fullThinking || undefined,
-      usage,
-      latency,
-      thinking_enabled: thinking?.enabled,
-      thinking_budget: thinking?.budget_tokens,
-      interaction,
-      error,
-    };
+    if (persistedOutcome) return persistedOutcome;
+    persistedOutcome = (async () => {
+      const { usage, latency } = captureStreamOutcome(status, error);
+      const log: ChatLog = {
+        id: logId,
+        request_id: ctx.requestId,
+        status,
+        session_id,
+        timestamp: new Date().toISOString(),
+        provider: OPENROUTER_PROVIDER,
+        model,
+        requested_model: requestedModel !== model ? requestedModel : undefined,
+        system_prompt: system,
+        messages,
+        response: fullResponse,
+        thinking_content: fullThinking || undefined,
+        usage,
+        latency,
+        thinking_enabled: thinking?.enabled,
+        thinking_budget: thinking?.budget_tokens,
+        interaction,
+        error,
+      };
 
-    await writeChatLog(log);
+      await writeChatLog(log);
 
-    return { log, usage, latency };
+      return { log, usage, latency };
+    })();
+    return persistedOutcome;
   }
 
   const readable = new ReadableStream({
