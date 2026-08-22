@@ -1,85 +1,20 @@
-import { existsSync, readFileSync } from "node:fs";
 import { appendFile, mkdir, readdir, rename, unlink, writeFile } from "node:fs/promises";
 import { dirname, extname, resolve, sep } from "node:path";
+import { LangfuseTracing } from "./langfuse";
+import type { ChatInteractionContext, ModelPricing } from "./langfuse";
+import type { LogContext, LogLevel } from "./logger";
+import { logger, shouldLog } from "./logger";
+import { loadDotEnv } from "./env";
+import { buildOpenRouterMessages, PROMPT_CACHE_TTL } from "./openrouter-messages";
+import type { Message } from "./types";
 
 // ── Config ──────────────────────────────────────────────────────────────────
-
-function trimInlineEnvComment(value: string): string {
-  let quote: string | null = null;
-  let escaped = false;
-
-  for (let i = 0; i < value.length; i++) {
-    const char = value[i];
-    if (escaped) {
-      escaped = false;
-      continue;
-    }
-    if (char === "\\") {
-      escaped = true;
-      continue;
-    }
-    if (quote) {
-      if (char === quote) quote = null;
-      continue;
-    }
-    if (char === "\"" || char === "'") {
-      quote = char;
-      continue;
-    }
-    if (char === "#" && (i === 0 || /\s/.test(value[i - 1]))) {
-      return value.slice(0, i).trimEnd();
-    }
-  }
-
-  return value.trimEnd();
-}
-
-function parseEnvValue(rawValue: string): string {
-  const trimmed = trimInlineEnvComment(rawValue).trim();
-  const quote = trimmed[0];
-  if (
-    (quote === "\"" || quote === "'") &&
-    trimmed.length >= 2 &&
-    trimmed[trimmed.length - 1] === quote
-  ) {
-    const inner = trimmed.slice(1, -1);
-    if (quote === "\"") {
-      return inner
-        .replace(/\\n/g, "\n")
-        .replace(/\\r/g, "\r")
-        .replace(/\\t/g, "\t")
-        .replace(/\\"/g, "\"")
-        .replace(/\\\\/g, "\\");
-    }
-    return inner;
-  }
-  return trimmed;
-}
-
-function loadDotEnv(envPath = resolve(".env")): void {
-  if (!existsSync(envPath)) return;
-
-  const content = readFileSync(envPath, "utf8");
-  for (const rawLine of content.split(/\r?\n/)) {
-    let line = rawLine.trim();
-    if (!line || line.startsWith("#")) continue;
-    if (line.startsWith("export ")) line = line.slice(7).trim();
-
-    const separator = line.indexOf("=");
-    if (separator <= 0) continue;
-
-    const key = line.slice(0, separator).trim();
-    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue;
-
-    process.env[key] = parseEnvValue(line.slice(separator + 1));
-  }
-}
 
 loadDotEnv();
 
 function parsePort(raw: string | undefined): number {
-  const parsed = Number.parseInt(raw || "3000", 10);
-  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 3000;
+  const parsed = Number.parseInt(raw || "9999", 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 9999;
 }
 
 function parsePositiveInteger(raw: string | undefined, fallback: number): number {
@@ -92,7 +27,22 @@ const LOGS_DIR = process.env.LOGS_DIR || "./logs";
 const CHATS_DIR = `${LOGS_DIR}/chats`;
 const CHAT_LOGS_JSONL = `${LOGS_DIR}/chat_logs.jsonl`;
 const MODEL_CACHE_JSON = `${LOGS_DIR}/openrouter_models_cache.json`;
-const PROMPT_CACHE_TTL = "1h" as const;
+/** Preferred reasoning effort. Mapped down per-model when unsupported (e.g. Kimi K3 only allows "max"). */
+const REASONING_EFFORT = "xhigh" as const;
+const REASONING_EFFORT_RANK = [
+  "max",
+  "xhigh",
+  "high",
+  "medium",
+  "low",
+  "minimal",
+  "none",
+] as const;
+type ReasoningEffort = (typeof REASONING_EFFORT_RANK)[number];
+const DEFAULT_MAX_TOKENS = 8192;
+const REASONING_MAX_TOKENS = 32_000;
+/** Always-on reasoners (Kimi K3, etc.) need more room so thinking does not exhaust max_tokens. */
+const MANDATORY_REASONING_MAX_TOKENS = 65_536;
 const DEFAULT_MODEL = process.env.OPENROUTER_DEFAULT_MODEL || "google/gemini-2.0-flash-001";
 const OPENROUTER_PROVIDER = "openrouter" as const;
 const OPENROUTER_API_BASE = (process.env.OPENROUTER_API_BASE || "https://openrouter.ai/api/v1").replace(/\/+$/, "");
@@ -101,7 +51,9 @@ const OPENROUTER_MODELS_URL = `${OPENROUTER_API_BASE}/models`;
 const LANGFUSE_PUBLIC_KEY = process.env.LANGFUSE_PUBLIC_KEY || "";
 const LANGFUSE_SECRET_KEY = process.env.LANGFUSE_SECRET_KEY || "";
 const LANGFUSE_BASE_URL = (process.env.LANGFUSE_BASE_URL || "https://cloud.langfuse.com").replace(/\/+$/, "");
-const LANGFUSE_REQUEST_TIMEOUT_MS = 4_000;
+/** Export attempts against slow/self-hosted instances need headroom; failures drop buffered spans. */
+const LANGFUSE_REQUEST_TIMEOUT_MS = parsePositiveInteger(process.env.LANGFUSE_REQUEST_TIMEOUT_MS, 15_000);
+const LANGFUSE_ENVIRONMENT = process.env.LANGFUSE_TRACING_ENVIRONMENT || "development";
 const OPENROUTER_CONNECT_TIMEOUT_MS = parsePositiveInteger(process.env.OPENROUTER_CONNECT_TIMEOUT_MS, 60_000);
 const OPENROUTER_STREAM_IDLE_TIMEOUT_MS = parsePositiveInteger(process.env.OPENROUTER_STREAM_IDLE_TIMEOUT_MS, 60_000);
 const MODEL_CACHE_TTL_MS = 5 * 60 * 1000;
@@ -112,28 +64,18 @@ const CHAT_ID_RE = /^[a-zA-Z0-9-]+$/;
 const THEME_ID_RE = /^[a-z0-9-]+$/;
 const PUBLIC_DIR = resolve("./public");
 
-type LogLevel = "debug" | "info" | "warn" | "error";
-type ConfiguredLogLevel = LogLevel | "silent";
-type LogContext = Record<string, unknown>;
-
-const LOG_LEVELS: Record<ConfiguredLogLevel, number> = {
-  debug: 10,
-  info: 20,
-  warn: 30,
-  error: 40,
-  silent: 50,
-};
-
-function parseLogLevel(value: string | undefined): ConfiguredLogLevel {
-  if (value === "debug" || value === "info" || value === "warn" || value === "error" || value === "silent") {
-    return value;
+function errorDetails(error: unknown): LogContext {
+  if (error instanceof Error) {
+    return {
+      name: error.name,
+      message: error.message,
+      ...(shouldLog("debug") && error.stack ? { stack: error.stack } : {}),
+    };
   }
-  return "info";
+  return { message: String(error) };
 }
 
-const LOG_LEVEL = parseLogLevel(process.env.LOG_LEVEL);
-
-function parseEnabled(value: string | undefined, defaultValue: boolean): boolean {
+export function parseEnabled(value: string | undefined, defaultValue: boolean): boolean {
   if (value === undefined) return defaultValue;
   const normalized = value.trim().toLowerCase();
   if (normalized === "0" || normalized === "false" || normalized === "no" || normalized === "off") {
@@ -147,46 +89,15 @@ function parseEnabled(value: string | undefined, defaultValue: boolean): boolean
 
 const LANGFUSE_ENABLED = parseEnabled(process.env.LANGFUSE_ENABLED, true);
 
-function errorDetails(error: unknown): LogContext {
-  if (error instanceof Error) {
-    return {
-      name: error.name,
-      message: error.message,
-      ...(LOG_LEVEL === "debug" && error.stack ? { stack: error.stack } : {}),
-    };
-  }
-  return { message: String(error) };
-}
-
-function cleanContext(context: LogContext): LogContext {
-  return Object.fromEntries(
-    Object.entries(context).filter(([, value]) => value !== undefined),
-  );
-}
-
-function writeLog(level: LogLevel, event: string, context: LogContext = {}): void {
-  if (LOG_LEVELS[level] < LOG_LEVELS[LOG_LEVEL]) return;
-
-  const record = {
-    timestamp: new Date().toISOString(),
-    level,
-    event,
-    ...cleanContext(context),
-  };
-  const line = JSON.stringify(record);
-  if (level === "warn" || level === "error") {
-    console.error(line);
-  } else {
-    console.log(line);
-  }
-}
-
-const logger = {
-  debug: (event: string, context?: LogContext) => writeLog("debug", event, context),
-  info: (event: string, context?: LogContext) => writeLog("info", event, context),
-  warn: (event: string, context?: LogContext) => writeLog("warn", event, context),
-  error: (event: string, context?: LogContext) => writeLog("error", event, context),
-};
+const langfuse = new LangfuseTracing({
+  enabled: LANGFUSE_ENABLED,
+  publicKey: LANGFUSE_PUBLIC_KEY,
+  secretKey: LANGFUSE_SECRET_KEY,
+  baseUrl: LANGFUSE_BASE_URL,
+  requestTimeoutMs: LANGFUSE_REQUEST_TIMEOUT_MS,
+  environment: LANGFUSE_ENVIRONMENT,
+  logger,
+});
 
 const openRouterApiKey = process.env.OPENROUTER_API_KEY;
 if (!openRouterApiKey) {
@@ -207,14 +118,92 @@ function openRouterHeaders(): HeadersInit {
 
 // ── Types ───────────────────────────────────────────────────────────────────
 
-type Message = { role: "user" | "assistant"; content: string };
-
 interface ChatRequest {
   model: string;
   system: string;
   messages: Message[];
   session_id: string;
   thinking?: { enabled: boolean; budget_tokens?: number };
+  /**
+   * How this turn was produced. The client branch tree forks on retry or
+   * edited re-send; passing the fork point lets traces express that lineage.
+   */
+  interaction?: ChatInteractionContext;
+}
+
+const INTERACTION_KINDS = ["send", "continue", "retry", "edit_resend"] as const;
+
+function parseInteraction(value: unknown):
+  | { ok: true; interaction: ChatInteractionContext | undefined }
+  | { ok: false, error: string } {
+  if (value === undefined) return { ok: true, interaction: undefined };
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return { ok: false, error: "interaction must be an object" };
+  }
+
+  const raw = value as Record<string, unknown>;
+  if (!INTERACTION_KINDS.includes(raw.kind as never)) {
+    return {
+      ok: false,
+      error: `interaction.kind must be one of: ${INTERACTION_KINDS.join(", ")}`,
+    };
+  }
+
+  const optionalId = (v: unknown): string | undefined =>
+    typeof v === "string" && v.length > 0 && v.length <= 200 ? v : undefined;
+
+  const positiveInt = (v: unknown): number | undefined => {
+    const parsed = typeof v === "number" ? v : Number.parseInt(v as string, 10);
+    return Number.isFinite(parsed) && parsed > 0 && Number.isInteger(parsed)
+      ? parsed
+      : undefined;
+  };
+
+  const chatId = optionalId(raw.chat_id);
+  if (chatId !== undefined && !CHAT_ID_RE.test(chatId)) {
+    return { ok: false, error: "interaction.chat_id is invalid" };
+  }
+
+  const assistantNodeId = optionalId(raw.assistant_node_id);
+  const branchedFromNodeId = optionalId(raw.branched_from_node_id);
+  const siblingIndex = positiveInt(raw.sibling_index);
+  const siblingCount = positiveInt(raw.sibling_count);
+  const pathLength = positiveInt(raw.path_length);
+
+  return {
+    ok: true,
+    interaction: {
+      kind: raw.kind as ChatInteractionContext["kind"],
+      ...(chatId ? { chatId } : {}),
+      ...(assistantNodeId ? { assistantNodeId } : {}),
+      ...(branchedFromNodeId ? { branchedFromNodeId } : {}),
+      ...(siblingIndex ? { siblingIndex } : {}),
+      ...(siblingCount ? { siblingCount } : {}),
+      ...(pathLength ? { pathLength } : {}),
+    },
+  };
+}
+
+// A branch tree of messages. The client owns its semantics (active path,
+// sibling ordering); the server persists it and hands it back verbatim.
+// `messages` on SavedChat mirrors the tree's active path for previews and any
+// reader that predates branching.
+interface ChatTreeNode {
+  id: string;
+  role: "user" | "assistant";
+  content: string;
+  parentId: string | null;
+  children: string[];
+  activeChildId: string | null;
+  thinking?: string;
+  meta?: Record<string, unknown>;
+}
+
+interface ChatTree {
+  version: number;
+  rootChildren: string[];
+  activeRootId: string | null;
+  nodes: Record<string, ChatTreeNode>;
 }
 
 interface SavedChat {
@@ -228,6 +217,7 @@ interface SavedChat {
   systemPrompt: string;
   thinkingEnabled: boolean;
   messages: Message[];
+  tree?: ChatTree;
 }
 
 interface ChatLog {
@@ -256,16 +246,17 @@ interface ChatLog {
   };
   thinking_enabled?: boolean;
   thinking_budget?: number;
+  /** How this turn was produced (fork lineage for retries / edited re-sends). */
+  interaction?: ChatInteractionContext;
   error?: string;
 }
 
-interface LangfuseInferenceEvent {
-  log: ChatLog;
-  startTime: Date;
-  endTime: Date;
-  completionStartTime?: Date;
-  requestedModel: string;
-  modelParameters: Record<string, unknown>;
+interface ModelReasoningInfo {
+  /** Effort values this model accepts, highest first when provided by OpenRouter. */
+  supported_efforts?: string[];
+  default_effort?: string;
+  default_enabled?: boolean;
+  mandatory?: boolean;
 }
 
 interface ModelCatalogEntry {
@@ -274,6 +265,7 @@ interface ModelCatalogEntry {
   description: string;
   context_length?: number;
   supported_parameters?: string[];
+  reasoning?: ModelReasoningInfo;
   pricing?: {
     prompt?: string;
     completion?: string;
@@ -297,169 +289,8 @@ let themeCatalogCache:
   | { fetchedAt: string; expiresAt: number; enabled: boolean; themes: ThemeCatalogEntry[] }
   | null = null;
 
-// ── LangFuse ───────────────────────────────────────────────────────────────
-
-function langfuseConfigured(): boolean {
-  return LANGFUSE_ENABLED && Boolean(LANGFUSE_PUBLIC_KEY && LANGFUSE_SECRET_KEY);
-}
-
-function langfuseIngestionUrl(): string {
-  if (LANGFUSE_BASE_URL.endsWith("/api/public/ingestion")) return LANGFUSE_BASE_URL;
-  if (LANGFUSE_BASE_URL.endsWith("/api/public")) return `${LANGFUSE_BASE_URL}/ingestion`;
-  return `${LANGFUSE_BASE_URL}/api/public/ingestion`;
-}
-
-function modelProvider(modelId: string): string {
-  const [provider] = modelId.split("/");
-  return provider || OPENROUTER_PROVIDER;
-}
-
 function dateFromPerfDelta(start: Date, deltaMs: number | null): Date | undefined {
   return deltaMs === null ? undefined : new Date(start.getTime() + Math.max(0, deltaMs));
-}
-
-function langfuseLevel(status: ChatLog["status"]): "DEFAULT" | "WARNING" | "ERROR" {
-  if (status === "failed") return "ERROR";
-  if (status === "cancelled") return "WARNING";
-  return "DEFAULT";
-}
-
-function langfuseUsageDetails(usage: ChatLog["usage"]): Record<string, number> {
-  const details: Record<string, number> = {
-    input: usage.input_tokens,
-    output: usage.output_tokens,
-    total: usage.input_tokens + usage.output_tokens,
-  };
-  if (usage.cache_read_input_tokens !== undefined) {
-    details.cache_read_input_tokens = usage.cache_read_input_tokens;
-  }
-  if (usage.cache_creation_input_tokens !== undefined) {
-    details.cache_creation_input_tokens = usage.cache_creation_input_tokens;
-  }
-  return details;
-}
-
-async function sendLangfuseInference(event: LangfuseInferenceEvent): Promise<void> {
-  if (!langfuseConfigured()) return;
-
-  const { log, startTime, endTime, completionStartTime, requestedModel, modelParameters } = event;
-  const upstreamProvider = modelProvider(log.model);
-  const level = langfuseLevel(log.status);
-  const statusMessage = log.error || (log.status === "cancelled" ? "cancelled by client" : undefined);
-  const traceId = log.id;
-  const generationId = crypto.randomUUID();
-  const now = new Date().toISOString();
-  const metadata = cleanContext({
-    app: "local-chat",
-    request_id: log.request_id,
-    log_id: log.id,
-    provider: log.provider,
-    upstream_provider: upstreamProvider,
-    requested_model: requestedModel !== log.model ? requestedModel : undefined,
-    thinking_enabled: log.thinking_enabled,
-    thinking_budget: log.thinking_budget,
-    thinking_chars: log.thinking_content?.length,
-    status: log.status,
-  });
-  const input = {
-    system: log.system_prompt,
-    messages: log.messages,
-  };
-  const usageDetails = langfuseUsageDetails(log.usage);
-
-  const payload = {
-    batch: [
-      {
-        id: crypto.randomUUID(),
-        timestamp: now,
-        type: "trace-create",
-        body: {
-          id: traceId,
-          timestamp: startTime.toISOString(),
-          name: "local-chat",
-          input,
-          output: log.response || statusMessage || "",
-          sessionId: log.session_id,
-          metadata,
-          tags: ["local-chat", log.provider, upstreamProvider],
-        },
-      },
-      {
-        id: crypto.randomUUID(),
-        timestamp: now,
-        type: "generation-create",
-        body: {
-          id: generationId,
-          traceId,
-          name: "chat.completions",
-          startTime: startTime.toISOString(),
-          endTime: endTime.toISOString(),
-          completionStartTime: completionStartTime?.toISOString(),
-          model: log.model,
-          modelParameters: cleanContext(modelParameters),
-          input,
-          output: log.response,
-          usage: {
-            promptTokens: log.usage.input_tokens,
-            completionTokens: log.usage.output_tokens,
-            totalTokens: log.usage.input_tokens + log.usage.output_tokens,
-          },
-          usageDetails,
-          level,
-          statusMessage,
-          metadata,
-        },
-      },
-    ],
-    metadata: {
-      source: "local-chat",
-      sdk: "custom-ingestion",
-    },
-  };
-
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), LANGFUSE_REQUEST_TIMEOUT_MS);
-  try {
-    const res = await fetch(langfuseIngestionUrl(), {
-      method: "POST",
-      headers: {
-        Authorization: `Basic ${btoa(`${LANGFUSE_PUBLIC_KEY}:${LANGFUSE_SECRET_KEY}`)}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(payload),
-      signal: controller.signal,
-    });
-    const responseText = await res.text();
-    let parsed: { errors?: unknown[] } | null = null;
-    try {
-      parsed = responseText ? JSON.parse(responseText) as { errors?: unknown[] } : null;
-    } catch {
-      parsed = null;
-    }
-
-    if (!res.ok || (parsed?.errors && parsed.errors.length > 0)) {
-      logger.warn("langfuse.ingestion_failed", {
-        request_id: log.request_id,
-        status: res.status,
-        errors: parsed?.errors,
-        body: !parsed ? responseText.slice(0, 300) : undefined,
-      });
-      return;
-    }
-
-    logger.debug("langfuse.ingestion_written", {
-      request_id: log.request_id,
-      trace_id: traceId,
-      generation_id: generationId,
-    });
-  } catch (error) {
-    logger.warn("langfuse.ingestion_error", {
-      request_id: log.request_id,
-      error: errorDetails(error),
-    });
-  } finally {
-    clearTimeout(timeout);
-  }
 }
 
 // ── Response Helpers ────────────────────────────────────────────────────────
@@ -569,7 +400,6 @@ function searchScore(model: ModelCatalogEntry, q: string): number {
   if (!query) return 0;
   if (id === query || name === query) return 100;
   if (qNorm && (idNorm === qNorm || nameNorm === qNorm)) return 95;
-  if (id === q || name === q) return 100;
   if (id.startsWith(query) || name.startsWith(query)) return 82;
   if (qNorm && (idNorm.startsWith(qNorm) || nameNorm.startsWith(qNorm))) return 78;
   if (id.includes(query)) return 65;
@@ -611,6 +441,22 @@ function slugifyThemeName(value: string): string {
   return slug || "theme";
 }
 
+function normalizeReasoningInfo(raw: unknown): ModelReasoningInfo | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const r = raw as Record<string, unknown>;
+  const supported_efforts = Array.isArray(r.supported_efforts)
+    ? r.supported_efforts.filter((x): x is string => typeof x === "string" && x.length > 0)
+    : undefined;
+  const info: ModelReasoningInfo = {};
+  if (supported_efforts && supported_efforts.length > 0) info.supported_efforts = supported_efforts;
+  if (typeof r.default_effort === "string" && r.default_effort.length > 0) {
+    info.default_effort = r.default_effort;
+  }
+  if (typeof r.default_enabled === "boolean") info.default_enabled = r.default_enabled;
+  if (typeof r.mandatory === "boolean") info.mandatory = r.mandatory;
+  return Object.keys(info).length > 0 ? info : undefined;
+}
+
 function normalizeModelEntries(rawModels: Array<Record<string, unknown>>): ModelCatalogEntry[] {
   return rawModels
     .filter((m) => typeof m.id === "string" && m.id.length > 0)
@@ -622,6 +468,7 @@ function normalizeModelEntries(rawModels: Array<Record<string, unknown>>): Model
       supported_parameters: Array.isArray(m.supported_parameters)
         ? m.supported_parameters.filter((x): x is string => typeof x === "string")
         : undefined,
+      reasoning: normalizeReasoningInfo(m.reasoning),
       pricing: m.pricing && typeof m.pricing === "object"
         ? {
             prompt: priceString(m.pricing as Record<string, unknown>, "prompt"),
@@ -636,10 +483,93 @@ function normalizeModelEntries(rawModels: Array<Record<string, unknown>>): Model
     .sort((a, b) => a.id.localeCompare(b.id));
 }
 
+function getModelCatalogEntry(modelId: string): ModelCatalogEntry | undefined {
+  return modelCatalogCache?.models.find((m) => m.id === modelId);
+}
+
+/** Per-token USD rates from the OpenRouter catalog, for Langfuse cost tracking. */
+function pricingForModel(modelId: string): ModelPricing | undefined {
+  const pricing = getModelCatalogEntry(modelId)?.pricing;
+  if (!pricing) return undefined;
+
+  const num = (value: string | undefined): number | undefined => {
+    if (value === undefined) return undefined;
+    const parsed = Number.parseFloat(value);
+    return Number.isFinite(parsed) ? parsed : undefined;
+  };
+
+  const entry: ModelPricing = {
+    ...(num(pricing.prompt) !== undefined ? { prompt: num(pricing.prompt) } : {}),
+    ...(num(pricing.completion) !== undefined ? { completion: num(pricing.completion) } : {}),
+    ...(num(pricing.input_cache_read) !== undefined ? { input_cache_read: num(pricing.input_cache_read) } : {}),
+    ...(num(pricing.input_cache_write) !== undefined ? { input_cache_write: num(pricing.input_cache_write) } : {}),
+    ...(num(pricing.cache_read) !== undefined ? { cache_read: num(pricing.cache_read) } : {}),
+    ...(num(pricing.cache_write) !== undefined ? { cache_write: num(pricing.cache_write) } : {}),
+  };
+  return Object.keys(entry).length > 0 ? entry : undefined;
+}
+
 function supportsReasoningForModel(modelId: string): boolean {
-  const model = modelCatalogCache?.models.find((m) => m.id === modelId);
+  const info = reasoningInfoForModel(modelId);
+  if (info?.mandatory || info?.default_enabled) return true;
+  const model = getModelCatalogEntry(modelId);
   if (!model) return true;
   return supportsReasoningParams(model.supported_parameters);
+}
+
+function isReasoningMandatoryForModel(modelId: string): boolean {
+  return reasoningInfoForModel(modelId)?.mandatory === true;
+}
+
+function effortRank(effort: string): number {
+  const idx = REASONING_EFFORT_RANK.indexOf(effort as ReasoningEffort);
+  return idx >= 0 ? idx : REASONING_EFFORT_RANK.length;
+}
+
+/**
+ * Catalog may lag (disk cache without OpenRouter's newer `reasoning` block).
+ * Known model-family constraints fill the gap.
+ */
+function heuristicReasoningInfo(modelId: string): ModelReasoningInfo | undefined {
+  const id = modelId.toLowerCase();
+  // Moonshot Kimi K3 always reasons; only effort "max" is supported today.
+  if (/(^|\/)kimi-k3(?:[:/]|$)/.test(id) || id.includes("kimi-k3")) {
+    return {
+      mandatory: true,
+      default_enabled: true,
+      supported_efforts: ["max"],
+    };
+  }
+  return undefined;
+}
+
+function reasoningInfoForModel(modelId: string): ModelReasoningInfo | undefined {
+  return getModelCatalogEntry(modelId)?.reasoning ?? heuristicReasoningInfo(modelId);
+}
+
+/**
+ * Pick a reasoning.effort value this model accepts.
+ * OpenRouter/Moonshot models like kimi-k3 only support "max"; sending "xhigh"
+ * with require_parameters can fail or be rejected upstream.
+ */
+function reasoningEffortForModel(modelId: string, preferred: string = REASONING_EFFORT): string {
+  const supported = reasoningInfoForModel(modelId)?.supported_efforts;
+  if (!supported || supported.length === 0) return preferred;
+
+  const normalizedPreferred = preferred.toLowerCase();
+  if (supported.some((e) => e.toLowerCase() === normalizedPreferred)) {
+    return supported.find((e) => e.toLowerCase() === normalizedPreferred) || preferred;
+  }
+
+  // Prefer the strongest effort the model actually lists.
+  const ranked = [...supported].sort((a, b) => effortRank(a.toLowerCase()) - effortRank(b.toLowerCase()));
+  return ranked[0] || preferred;
+}
+
+function maxTokensForReasoning(modelId: string, reasoningEnabled: boolean): number {
+  if (!reasoningEnabled) return DEFAULT_MAX_TOKENS;
+  if (isReasoningMandatoryForModel(modelId)) return MANDATORY_REASONING_MAX_TOKENS;
+  return REASONING_MAX_TOKENS;
 }
 
 async function hydrateModelCacheFromDisk(): Promise<void> {
@@ -952,7 +882,17 @@ function validateMessages(value: unknown):
       return { ok: false, error: "Message content must be a string" };
     }
 
-    messages.push({ role, content });
+    const thinkingRaw = (msg as Record<string, unknown>).thinking
+      ?? (msg as Record<string, unknown>).reasoning
+      ?? (msg as Record<string, unknown>).reasoning_content;
+    const thinking =
+      typeof thinkingRaw === "string" && thinkingRaw.length > 0 ? thinkingRaw : undefined;
+
+    messages.push({
+      role,
+      content,
+      ...(thinking ? { thinking } : {}),
+    });
   }
 
   return { ok: true, messages };
@@ -1003,6 +943,9 @@ function validateChatRequest(body: unknown):
     thinking = { enabled: t.enabled, budget_tokens: t.budget_tokens as number | undefined };
   }
 
+  const parsedInteraction = parseInteraction(b.interaction);
+  if (!parsedInteraction.ok) return parsedInteraction;
+
   return {
     ok: true,
     data: {
@@ -1011,6 +954,7 @@ function validateChatRequest(body: unknown):
       messages: parsedMessages.messages,
       session_id: b.session_id as string,
       thinking,
+      interaction: parsedInteraction.interaction,
     },
   };
 }
@@ -1052,11 +996,6 @@ function isUpstreamTimeoutError(error: unknown): boolean {
   return error instanceof UpstreamTimeoutError;
 }
 
-function reasoningConfigForThinking(thinking: ChatRequest["thinking"]): Record<string, unknown> | undefined {
-  if (thinking?.enabled !== true) return undefined;
-  return { effort: "xhigh" };
-}
-
 async function handleStream(req: Request, ctx: RequestContext): Promise<Response> {
   let body: unknown;
   try { body = await req.json(); } catch {
@@ -1066,7 +1005,7 @@ async function handleStream(req: Request, ctx: RequestContext): Promise<Response
   const v = validateChatRequest(body);
   if (!v.ok) return errorResponse(v.error);
 
-  const { model: requestedModel, system, messages, session_id, thinking } = v.data;
+  const { model: requestedModel, system, messages, session_id, thinking, interaction } = v.data;
   const model = await resolveRequestedModelId(requestedModel);
   const logId = crypto.randomUUID();
   const streamStartTime = new Date();
@@ -1077,7 +1016,13 @@ async function handleStream(req: Request, ctx: RequestContext): Promise<Response
   let fullThinking = "";
   let upstreamUsage: Record<string, unknown> | undefined;
   const thinkingRequested = thinking?.enabled === true;
-  const thinkingSupported = thinkingRequested ? supportsReasoningForModel(model) : false;
+  const thinkingSupported = supportsReasoningForModel(model);
+  const reasoningMandatory = isReasoningMandatoryForModel(model);
+  // Kimi K3 (and similar) always reason; still send a valid effort + higher max_tokens
+  // even when the UI Think toggle is off so output is not truncated mid-thinking.
+  const reasoningEnabled =
+    reasoningMandatory || (thinkingRequested && thinkingSupported);
+  const reasoningEffort = reasoningEnabled ? reasoningEffortForModel(model) : undefined;
 
   logger.info("chat.stream.start", {
     request_id: ctx.requestId,
@@ -1088,62 +1033,28 @@ async function handleStream(req: Request, ctx: RequestContext): Promise<Response
     messages: messages.length,
     system_prompt_chars: system.length,
     thinking_requested: thinkingRequested,
-    thinking_sent: thinkingRequested && thinkingSupported,
+    thinking_sent: reasoningEnabled,
+    reasoning_mandatory: reasoningMandatory || undefined,
+    reasoning_effort: reasoningEffort,
+    interaction: interaction?.kind || "new",
   });
 
-  if (thinkingRequested && !thinkingSupported) {
+  if (thinkingRequested && !thinkingSupported && !reasoningMandatory) {
     logger.info("chat.thinking.skipped_unsupported_model", {
       request_id: ctx.requestId,
       model,
     });
   }
 
-  const openRouterMessages: Array<Record<string, unknown>> = [];
-  if (system) {
-    openRouterMessages.push({
-      role: "system",
-      content: [
-        {
-          type: "text",
-          text: system,
-          cache_control: { type: "ephemeral", ttl: PROMPT_CACHE_TTL },
-        },
-      ],
-    });
-  }
+  const openRouterMessages = buildOpenRouterMessages(system, messages);
 
-  for (let i = 0; i < messages.length; i++) {
-    const msg = messages[i];
-    openRouterMessages.push({
-      role: msg.role,
-      content: [
-        {
-          type: "text",
-          text: msg.content,
-          ...(i === messages.length - 2 && {
-            cache_control: { type: "ephemeral", ttl: PROMPT_CACHE_TTL },
-          }),
-        },
-      ],
-    });
-  }
-
-  const maxTokens = thinkingRequested && thinkingSupported ? 32000 : 8192;
-  const reasoningConfig = thinkingRequested && thinkingSupported
-    ? reasoningConfigForThinking(thinking)
-    : undefined;
+  const maxTokens = maxTokensForReasoning(model, reasoningEnabled);
   const modelParameters: Record<string, unknown> = {
     stream: true,
     max_tokens: maxTokens,
-    thinking_enabled: thinkingRequested && thinkingSupported,
+    thinking_enabled: reasoningEnabled,
     thinking_budget: thinking?.budget_tokens,
   };
-  if (reasoningConfig?.effort) {
-    modelParameters.reasoning_effort = reasoningConfig.effort;
-  }
-  if (reasoningConfig?.max_tokens) {
-    modelParameters.reasoning_max_tokens = reasoningConfig.max_tokens;
-  }
 
   const requestBody: Record<string, unknown> = {
     model,
@@ -1153,9 +1064,56 @@ async function handleStream(req: Request, ctx: RequestContext): Promise<Response
     max_tokens: maxTokens,
     user: session_id,
   };
-  if (reasoningConfig) {
-    requestBody.reasoning = reasoningConfig;
+  if (reasoningEnabled && reasoningEffort) {
+    requestBody.reasoning = { effort: reasoningEffort };
     requestBody.provider = { require_parameters: true };
+    modelParameters.reasoning_effort = reasoningEffort;
+    modelParameters.require_parameters = true;
+  }
+
+  const langfuseTrace = await langfuse.startChatTrace({
+    logId,
+    requestId: ctx.requestId,
+    sessionId: session_id,
+    provider: OPENROUTER_PROVIDER,
+    requestedModel,
+    model,
+    systemPrompt: system,
+    messages,
+    upstreamMessages: openRouterMessages,
+    modelParameters,
+    thinkingRequested,
+    thinkingEnabled: reasoningEnabled,
+    interaction,
+    pricing: pricingForModel(model),
+    startTime: streamStartTime,
+  });
+
+  function captureStreamOutcome(status: ChatLog["status"], error?: string) {
+    const endTime = new Date();
+    const elapsed = performance.now() - t0;
+    const usage = normalizeUsage(upstreamUsage);
+    const latency = {
+      time_to_first_token_ms: Math.round(ttft ?? elapsed),
+      total_time_ms: Math.round(elapsed),
+      time_to_first_thinking_ms: ttfThinking !== null ? Math.round(ttfThinking) : undefined,
+    };
+
+    langfuseTrace?.finish(
+      {
+        status,
+        response: fullResponse,
+        thinking: fullThinking || undefined,
+        usage,
+        latency,
+        completionStartTime: dateFromPerfDelta(streamStartTime, ttft),
+        endTime,
+        error,
+      },
+      pricingForModel(model),
+    );
+
+    return { usage, latency, endTime };
   }
 
   const upstreamAbortController = new AbortController();
@@ -1214,6 +1172,7 @@ async function handleStream(req: Request, ctx: RequestContext): Promise<Response
     clearConnectTimeout();
     req.signal.removeEventListener("abort", abortUpstream);
     if (upstreamTimedOut) {
+      captureStreamOutcome("failed", upstreamTimeoutMessage);
       logger.warn("chat.upstream.timeout_before_stream", {
         request_id: ctx.requestId,
         log_id: logId,
@@ -1223,6 +1182,7 @@ async function handleStream(req: Request, ctx: RequestContext): Promise<Response
       return errorResponse(upstreamTimeoutMessage, 504);
     }
     if (clientCancelled || isAbortLikeError(error)) {
+      captureStreamOutcome("cancelled", "cancelled by client");
       logger.info("chat.upstream.cancelled_before_stream", {
         request_id: ctx.requestId,
         log_id: logId,
@@ -1231,6 +1191,7 @@ async function handleStream(req: Request, ctx: RequestContext): Promise<Response
       return new Response(null, { status: 499 });
     }
     const msg = error instanceof Error ? error.message : "Failed to connect to OpenRouter";
+    captureStreamOutcome("failed", msg);
     logger.error("chat.upstream.connection_failed", {
       request_id: ctx.requestId,
       log_id: logId,
@@ -1245,6 +1206,12 @@ async function handleStream(req: Request, ctx: RequestContext): Promise<Response
     req.signal.removeEventListener("abort", abortUpstream);
     const details = await upstream.text();
     const trimmed = details.trim().slice(0, 600);
+    captureStreamOutcome(
+      "failed",
+      trimmed
+        ? `OpenRouter request failed (${upstream.status}): ${trimmed}`
+        : `OpenRouter request failed (${upstream.status})`,
+    );
     logger.warn("chat.upstream.rejected", {
       request_id: ctx.requestId,
       log_id: logId,
@@ -1261,6 +1228,7 @@ async function handleStream(req: Request, ctx: RequestContext): Promise<Response
   }
   if (!upstream.body) {
     req.signal.removeEventListener("abort", abortUpstream);
+    captureStreamOutcome("failed", "OpenRouter response did not include a stream");
     logger.error("chat.upstream.empty_stream", {
       request_id: ctx.requestId,
       log_id: logId,
@@ -1277,13 +1245,7 @@ async function handleStream(req: Request, ctx: RequestContext): Promise<Response
     status: ChatLog["status"],
     error?: string,
   ): Promise<{ log: ChatLog; usage: ChatLog["usage"]; latency: ChatLog["latency"] }> {
-    const elapsed = performance.now() - t0;
-    const usage = normalizeUsage(upstreamUsage);
-    const latency = {
-      time_to_first_token_ms: Math.round(ttft ?? elapsed),
-      total_time_ms: Math.round(elapsed),
-      time_to_first_thinking_ms: ttfThinking !== null ? Math.round(ttfThinking) : undefined,
-    };
+    const { usage, latency } = captureStreamOutcome(status, error);
     const log: ChatLog = {
       id: logId,
       request_id: ctx.requestId,
@@ -1301,18 +1263,11 @@ async function handleStream(req: Request, ctx: RequestContext): Promise<Response
       latency,
       thinking_enabled: thinking?.enabled,
       thinking_budget: thinking?.budget_tokens,
+      interaction,
       error,
     };
 
     await writeChatLog(log);
-    void sendLangfuseInference({
-      log,
-      startTime: streamStartTime,
-      endTime: new Date(),
-      completionStartTime: dateFromPerfDelta(streamStartTime, ttft),
-      requestedModel,
-      modelParameters,
-    });
 
     return { log, usage, latency };
   }
@@ -1639,10 +1594,10 @@ async function handleSaveChat(req: Request): Promise<Response> {
     return errorResponse("Invalid JSON");
   }
 
-  const b = body as Record<string, unknown>;
   if (!body || typeof body !== "object") {
     return errorResponse("Invalid request body");
   }
+  const b = body as Record<string, unknown>;
 
   if (!b.sessionId || typeof b.sessionId !== "string") {
     return errorResponse("sessionId is required");
@@ -1652,6 +1607,7 @@ async function handleSaveChat(req: Request): Promise<Response> {
 
   const id = (typeof b.id === "string" && CHAT_ID_RE.test(b.id)) ? b.id : crypto.randomUUID();
   const now = new Date().toISOString();
+  const tree = sanitizeChatTree(b.tree);
 
   const release = await mutexFor(id).acquire();
   try {
@@ -1667,6 +1623,7 @@ async function handleSaveChat(req: Request): Promise<Response> {
           systemPrompt: b.systemPrompt != null ? str(b.systemPrompt) : existing.systemPrompt,
           thinkingEnabled: typeof b.thinkingEnabled === "boolean" ? b.thinkingEnabled : existing.thinkingEnabled,
           messages: parsedMessages.messages,
+          tree: tree ?? existing.tree,
           ...(str(b.title) && { title: str(b.title) }),
         }
       : {
@@ -1681,6 +1638,7 @@ async function handleSaveChat(req: Request): Promise<Response> {
           systemPrompt: str(b.systemPrompt) || "",
           thinkingEnabled: typeof b.thinkingEnabled === "boolean" ? b.thinkingEnabled : false,
           messages: parsedMessages.messages,
+          tree,
         };
 
     await atomicWrite(chatPath(id), JSON.stringify(chat, null, 2));
@@ -1800,6 +1758,23 @@ async function handleDeleteChat(id: string): Promise<Response> {
 
 function str(v: unknown): string {
   return typeof v === "string" ? v : "";
+}
+
+// Shape-check the branch tree before persisting so a malformed payload can't
+// corrupt the saved file. The client is the source of truth for branch
+// semantics, so this stays a shallow guard rather than a deep validation.
+function sanitizeChatTree(value: unknown): ChatTree | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const t = value as Record<string, unknown>;
+  if (!t.nodes || typeof t.nodes !== "object") return undefined;
+  if (!Array.isArray(t.rootChildren)) return undefined;
+
+  return {
+    version: typeof t.version === "number" ? t.version : 1,
+    rootChildren: t.rootChildren.filter((id): id is string => typeof id === "string"),
+    activeRootId: typeof t.activeRootId === "string" ? t.activeRootId : null,
+    nodes: t.nodes as Record<string, ChatTreeNode>,
+  };
 }
 
 function autoTitle(messages: Message[]): string {
@@ -1942,5 +1917,19 @@ logger.info("server.started", {
   logs_dir: LOGS_DIR,
   chats_dir: CHATS_DIR,
   openrouter_base_url: OPENROUTER_API_BASE,
-  langfuse_enabled: langfuseConfigured(),
+  langfuse_enabled: langfuse.enabled,
+  langfuse_environment: langfuse.enabled ? LANGFUSE_ENVIRONMENT : undefined,
 });
+
+let shuttingDown = false;
+async function shutdown(signal: string): Promise<void> {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  logger.info("server.stopping", { signal });
+  server.stop(true);
+  await langfuse.shutdown();
+  process.exit(0);
+}
+
+process.once("SIGINT", () => void shutdown("SIGINT"));
+process.once("SIGTERM", () => void shutdown("SIGTERM"));

@@ -5,10 +5,15 @@
   "scripts": {
     "start": "bun run server.ts",
     "dev": "bun --watch run server.ts",
+    "backfill": "bun run backfill-langfuse.ts",
     "typecheck": "tsc --noEmit",
     "test": "bun test"
   },
-  "dependencies": {},
+  "dependencies": {
+    "@langfuse/otel": "^5.10.0",
+    "@langfuse/tracing": "^5.10.0",
+    "@opentelemetry/sdk-trace-node": "^2.10"
+  },
   "devDependencies": {
     "@types/bun": "^1.1.0",
     "typescript": "^5.9.3"

@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { langfuseCostDetails, langfuseUsageDetails } from "./langfuse";
 
 let BASE_URL = process.env.TEST_BASE_URL || "";
 let appProcess: ReturnType<typeof Bun.spawn> | null = null;
@@ -10,7 +11,13 @@ let mockLangfuse: ReturnType<typeof Bun.serve> | null = null;
 let testRoot = "";
 let testLogsDir = "";
 let mockOpenRouterCancelCount = 0;
-const langfuseBatches: Array<{ auth: string | null; body: Record<string, unknown> }> = [];
+const langfuseExports: Array<{
+  auth: string | null;
+  contentType: string | null;
+  body: Uint8Array;
+  searchableText: string;
+  json: Record<string, unknown>;
+}> = [];
 const openRouterChatBodies: Array<Record<string, unknown>> = [];
 
 function randomPort(): number {
@@ -43,6 +50,28 @@ function startMockOpenRouter(): ReturnType<typeof Bun.serve> {
                 completion: "0.000012",
                 input_cache_read: "0.0000005",
                 input_cache_write: "0.000002",
+              },
+            },
+            {
+              id: "moonshotai/kimi-k3",
+              name: "MoonshotAI: Kimi K3",
+              description: "Mock Kimi K3 for reasoning-effort mapping tests",
+              context_length: 1_048_576,
+              supported_parameters: [
+                "include_reasoning",
+                "max_tokens",
+                "reasoning",
+                "reasoning_effort",
+              ],
+              reasoning: {
+                mandatory: true,
+                default_enabled: true,
+                supported_efforts: ["max"],
+              },
+              pricing: {
+                prompt: "0.000003",
+                completion: "0.000015",
+                input_cache_read: "0.0000003",
               },
             },
           ],
@@ -99,6 +128,9 @@ function startMockOpenRouter(): ReturnType<typeof Bun.serve> {
           new ReadableStream({
             start(controller) {
               controller.enqueue(encoder.encode(sse({
+                choices: [{ delta: { reasoning: "I should answer with OK." } }],
+              })));
+              controller.enqueue(encoder.encode(sse({
                 choices: [{ delta: { content: "OK" } }],
               })));
               controller.enqueue(encoder.encode(sse({
@@ -127,26 +159,22 @@ function startMockLangfuse(): ReturnType<typeof Bun.serve> {
     port: 0,
     async fetch(req) {
       const url = new URL(req.url);
-      if (url.pathname !== "/api/public/ingestion") {
+      if (url.pathname !== "/api/public/otel/v1/traces") {
         return new Response("Not found", { status: 404 });
       }
 
-      const body = await req.json() as Record<string, unknown>;
-      langfuseBatches.push({
+      const body = new Uint8Array(await req.arrayBuffer());
+      const searchableText = new TextDecoder().decode(body);
+      langfuseExports.push({
         auth: req.headers.get("authorization"),
+        contentType: req.headers.get("content-type"),
         body,
+        searchableText,
+        json: JSON.parse(searchableText) as Record<string, unknown>,
       });
-      const batch = Array.isArray(body.batch) ? body.batch : [];
-      return Response.json(
-        {
-          successes: batch.map((event) => ({
-            id: (event as Record<string, unknown>).id,
-            status: 201,
-          })),
-          errors: [],
-        },
-        { status: 207 },
-      );
+      return Response.json({}, {
+        status: 200,
+      });
     },
   });
 }
@@ -264,6 +292,21 @@ afterAll(async () => {
 });
 
 describe("Chat API", () => {
+  test("Langfuse usage details use mutually exclusive cache buckets", () => {
+    expect(langfuseUsageDetails({
+      input_tokens: 12,
+      output_tokens: 1,
+      cache_read_input_tokens: 4,
+      cache_creation_input_tokens: 2,
+    })).toEqual({
+      input: 6,
+      output: 1,
+      total: 13,
+      cache_read_input_tokens: 4,
+      cache_creation_input_tokens: 2,
+    });
+  });
+
   test("GET /api/models returns OpenRouter model catalog", async () => {
     const res = await fetch(`${BASE_URL}/api/models`);
     const data = await res.json();
@@ -314,7 +357,7 @@ describe("Chat API", () => {
   });
 
   test("POST /api/chat streams response and writes a structured chat log", async () => {
-    langfuseBatches.length = 0;
+    langfuseExports.length = 0;
     const model = await getAnyModel();
     const res = await fetch(`${BASE_URL}/api/chat`, {
       method: "POST",
@@ -380,25 +423,24 @@ describe("Chat API", () => {
       expect(lastLog.provider).toBe("openrouter");
       expect(lastLog.request_id).toBeTruthy();
       expect(lastLog.response).toBe("OK");
+      expect(lastLog.thinking_content).toBe("I should answer with OK.");
       expect(lastLog.usage.input_tokens).toBe(12);
       expect(lastLog.usage.output_tokens).toBe(1);
       expect(lastLog.usage.cache_creation_input_tokens).toBe(2);
     }
 
-    await waitForCondition(() => langfuseBatches.length > 0, "LangFuse ingestion");
-    const lastBatch = langfuseBatches.at(-1);
-    expect(lastBatch?.auth).toBe(`Basic ${btoa("pk-test:sk-test")}`);
-    const batch = lastBatch?.body.batch;
-    expect(Array.isArray(batch)).toBe(true);
-    const events = batch as Array<{ type: string; body: Record<string, unknown> }>;
-    const traceEvent = events.find((event) => event.type === "trace-create");
-    const generationEvent = events.find((event) => event.type === "generation-create");
-    expect(traceEvent?.body.sessionId).toBe("test-session-123");
-    expect(generationEvent?.body.model).toBe(model);
-    expect(generationEvent?.body.output).toBe("OK");
-    expect((generationEvent?.body.usageDetails as Record<string, number>).input).toBe(12);
-    expect((generationEvent?.body.usageDetails as Record<string, number>).output).toBe(1);
-    expect((generationEvent?.body.usageDetails as Record<string, number>).cache_creation_input_tokens).toBe(2);
+    await waitForCondition(() => langfuseExports.length > 0, "Langfuse OTLP export");
+    const lastExport = langfuseExports.at(-1);
+    expect(lastExport?.auth).toBe(`Basic ${btoa("pk-test:sk-test")}`);
+    expect(lastExport?.contentType).toContain("application/json");
+    expect(lastExport?.body.byteLength).toBeGreaterThan(0);
+    expect(Array.isArray(lastExport?.json.resourceSpans)).toBe(true);
+    expect(lastExport?.searchableText).toContain("chat.request");
+    expect(lastExport?.searchableText).toContain("openrouter.chat.completions");
+    expect(lastExport?.searchableText).toContain("test-session-123");
+    expect(lastExport?.searchableText).toContain(model);
+    expect(lastExport?.searchableText).toContain("cache_creation_input_tokens");
+    expect(lastExport?.searchableText).toContain("I should answer with OK.");
   });
 
   test("POST /api/chat accepts a conversation ending with an assistant turn (continuation)", async () => {
@@ -660,6 +702,162 @@ describe("Chat API", () => {
     expect(upstream?.max_tokens).toBe(32000);
   });
 
+  test("POST /api/chat maps Kimi K3 thinking to effort max only", async () => {
+    openRouterChatBodies.length = 0;
+
+    const res = await fetch(`${BASE_URL}/api/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "moonshotai/kimi-k3",
+        system: "",
+        messages: [{ role: "user", content: "Kimi K3 thinking test" }],
+        session_id: "test-kimi-k3-thinking",
+        thinking: { enabled: true },
+      }),
+    });
+    expect(res.status).toBe(200);
+    await res.text();
+
+    const upstream = openRouterChatBodies.at(-1);
+    expect(upstream).toBeTruthy();
+    // K3 only accepts "max"; "xhigh" + require_parameters is invalid for this model.
+    expect(upstream?.reasoning).toEqual({ effort: "max" });
+    expect(upstream?.provider).toEqual({ require_parameters: true });
+    expect(upstream?.max_tokens).toBe(65_536);
+  });
+
+  test("POST /api/chat always enables reasoning for mandatory reasoners", async () => {
+    openRouterChatBodies.length = 0;
+
+    const res = await fetch(`${BASE_URL}/api/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "moonshotai/kimi-k3",
+        system: "",
+        messages: [{ role: "user", content: "Kimi K3 no UI think toggle" }],
+        session_id: "test-kimi-k3-mandatory",
+      }),
+    });
+    expect(res.status).toBe(200);
+    await res.text();
+
+    const upstream = openRouterChatBodies.at(-1);
+    expect(upstream).toBeTruthy();
+    expect(upstream?.reasoning).toEqual({ effort: "max" });
+    expect(upstream?.max_tokens).toBe(65_536);
+  });
+
+  test("POST /api/chat replays assistant thinking for multi-turn Kimi K3", async () => {
+    openRouterChatBodies.length = 0;
+
+    const res = await fetch(`${BASE_URL}/api/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "moonshotai/kimi-k3",
+        system: "",
+        messages: [
+          { role: "user", content: "Remember BLUE42" },
+          {
+            role: "assistant",
+            content: "OK",
+            thinking: "User asked me to remember BLUE42; reply OK.",
+          },
+          { role: "user", content: "What was the code?" },
+        ],
+        session_id: "test-kimi-k3-replay",
+        thinking: { enabled: true },
+      }),
+    });
+    expect(res.status).toBe(200);
+    await res.text();
+
+    const upstream = openRouterChatBodies.at(-1);
+    expect(upstream).toBeTruthy();
+    const msgs = upstream?.messages as Array<Record<string, unknown>>;
+    expect(Array.isArray(msgs)).toBe(true);
+    const assistant = msgs.find((m) => m.role === "assistant");
+    expect(assistant).toBeTruthy();
+    expect(assistant?.reasoning).toBe("User asked me to remember BLUE42; reply OK.");
+    expect(assistant?.reasoning_content).toBe("User asked me to remember BLUE42; reply OK.");
+  });
+
+  test("POST /api/chat strips trailing empty assistant placeholder (Moonshot empty text)", async () => {
+    openRouterChatBodies.length = 0;
+    const model = await getAnyModel();
+
+    const res = await fetch(`${BASE_URL}/api/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model,
+        system: "",
+        // Client streaming stub: empty assistant after the user turn.
+        messages: [
+          { role: "user", content: "Hello" },
+          { role: "assistant", content: "" },
+        ],
+        session_id: "test-empty-assistant-stub",
+      }),
+    });
+    expect(res.status).toBe(200);
+    await res.text();
+
+    const upstream = openRouterChatBodies.at(-1);
+    expect(upstream).toBeTruthy();
+    const msgs = upstream?.messages as Array<Record<string, unknown>>;
+    expect(msgs).toHaveLength(1);
+    expect(msgs[0]?.role).toBe("user");
+    const content = msgs[0]?.content as Array<{ type: string; text: string }>;
+    expect(Array.isArray(content)).toBe(true);
+    expect(content[0]?.text).toBe("Hello");
+    expect(content[0]?.text.length).toBeGreaterThan(0);
+  });
+
+  test("POST /api/chat never sends empty text parts for thinking-only assistant turns", async () => {
+    openRouterChatBodies.length = 0;
+
+    const res = await fetch(`${BASE_URL}/api/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "moonshotai/kimi-k3",
+        system: "",
+        messages: [
+          { role: "user", content: "Think then answer" },
+          {
+            role: "assistant",
+            content: "",
+            thinking: "I started reasoning but output was interrupted.",
+          },
+          { role: "user", content: "Continue" },
+        ],
+        session_id: "test-thinking-only-empty-content",
+        thinking: { enabled: true },
+      }),
+    });
+    expect(res.status).toBe(200);
+    await res.text();
+
+    const upstream = openRouterChatBodies.at(-1);
+    const msgs = upstream?.messages as Array<Record<string, unknown>>;
+    expect(Array.isArray(msgs)).toBe(true);
+    for (const msg of msgs) {
+      const parts = msg.content as Array<{ type?: string; text?: string }>;
+      expect(Array.isArray(parts)).toBe(true);
+      for (const part of parts) {
+        if (part?.type === "text") {
+          expect(typeof part.text).toBe("string");
+          expect((part.text || "").length).toBeGreaterThan(0);
+        }
+      }
+    }
+    const assistant = msgs.find((m) => m.role === "assistant");
+    expect(assistant?.reasoning).toBe("I started reasoning but output was interrupted.");
+  });
+
   test("POST /api/chat sends no reasoning config when thinking is off", async () => {
     const model = await getAnyModel();
     openRouterChatBodies.length = 0;
@@ -746,5 +944,111 @@ describe("Chat API", () => {
     expect(res.status).toBe(400);
     const data = await res.json();
     expect(data.error).toContain("Invalid JSON");
+  });
+
+  test("POST /api/chat rejects an invalid interaction kind", async () => {
+    const model = await getAnyModel();
+    const res = await fetch(`${BASE_URL}/api/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model,
+        system: "",
+        messages: [{ role: "user", content: "Test" }],
+        session_id: "test-interaction-invalid",
+        interaction: { kind: "time-travel" },
+      }),
+    });
+
+    expect(res.status).toBe(400);
+    const data = await res.json();
+    expect(data.error).toContain("interaction.kind");
+  });
+
+  test("forked turns (retry) export fork lineage to Langfuse with cost details", async () => {
+    langfuseExports.length = 0;
+    const model = await getAnyModel();
+    const sessionId = `fork-session-${Date.now()}`;
+
+    const res = await fetch(`${BASE_URL}/api/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model,
+        system: "You are a helpful assistant.",
+        messages: [
+          { role: "user", content: "First attempt prompt" },
+          { role: "assistant", content: "First attempt answer" },
+        ],
+        session_id: sessionId,
+        // Retry fork: fresh sibling of the first assistant reply.
+        interaction: {
+          kind: "retry",
+          chat_id: "0f0f0f0f-1111-4222-8333-444455556666",
+          assistant_node_id: "n-fork-new",
+          branched_from_node_id: "n-fork-old",
+          sibling_index: 2,
+          sibling_count: 2,
+          path_length: 4,
+        },
+      }),
+    });
+    expect(res.status).toBe(200);
+    await res.text();
+
+    await waitForCondition(() => langfuseExports.length > 0, "Langfuse OTLP export");
+    const lastExport = langfuseExports.at(-1);
+    const text = lastExport?.searchableText || "";
+
+    expect(text).toContain(sessionId);
+    expect(text).toContain("interaction_kind");
+    expect(text).toContain("n-fork-old");
+    expect(text).toContain("n-fork-new");
+    expect(text).toContain("fork-retry");
+    expect(text).toContain("0f0f0f0f-1111-4222-8333-444455556666");
+  });
+});
+
+describe("Langfuse cost details", () => {
+  const pricing = {
+    prompt: 0.000002,
+    completion: 0.000012,
+    input_cache_read: 0.0000005,
+    input_cache_write: 0.000002,
+  };
+
+  test("computes cache-aware USD costs", () => {
+    const details = langfuseCostDetails(pricing, {
+      input_tokens: 12,
+      output_tokens: 1,
+      cache_read_input_tokens: 4,
+      cache_creation_input_tokens: 2,
+    });
+    // 6 uncached input tokens + 4 cache-read + 2 cache-write + 1 output.
+    expect(details?.input).toBeCloseTo(0.000018, 12);
+    expect(details?.output).toBeCloseTo(0.000012, 12);
+    expect(details?.total).toBeCloseTo(0.00003, 12);
+  });
+
+  test("falls back to the base prompt rate when cache rates are missing", () => {
+    const details = langfuseCostDetails(
+      { prompt: 0.000001, completion: 0.000002 },
+      {
+        input_tokens: 10,
+        output_tokens: 5,
+        cache_read_input_tokens: 4,
+      },
+    );
+    // All 10 input tokens bill at the base rate.
+    expect(details?.input).toBeCloseTo(0.00001, 12);
+    expect(details?.output).toBeCloseTo(0.00001, 12);
+    expect(details?.total).toBeCloseTo(0.00002, 12);
+  });
+
+  test("returns undefined when no pricing is available", () => {
+    expect(langfuseCostDetails(undefined, {
+      input_tokens: 10,
+      output_tokens: 5,
+    })).toBeUndefined();
   });
 });
