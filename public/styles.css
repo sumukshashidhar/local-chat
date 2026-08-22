@@ -748,6 +748,49 @@ main {
   cursor: default;
 }
 
+/* ── Branch navigation (‹ 2/6 ›) ─────────────────────────────────────────────
+   Shown only when a message has siblings from a retry or an edited resend.
+   Always visible (it's navigation, not a hover affordance), but quiet. */
+
+.branch-nav {
+  display: inline-flex;
+  align-items: center;
+  gap: 1px;
+  margin-top: 12px;
+  user-select: none;
+}
+
+.branch-nav button {
+  width: 22px;
+  height: 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: none;
+  border-radius: var(--radius-xs);
+  color: var(--text-dim);
+  cursor: pointer;
+  font-size: 15px;
+  line-height: 1;
+  transition: background var(--fast), color var(--fast), transform var(--fast);
+}
+
+.branch-nav button:hover:not(:disabled) { background: var(--surface-hover); color: var(--text); }
+.branch-nav button:active:not(:disabled) { transform: scale(0.9); }
+.branch-nav button:disabled { opacity: 0.3; cursor: default; }
+
+.branch-count {
+  min-width: 30px;
+  padding: 0 3px;
+  text-align: center;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.01em;
+}
+
 /* ── Thinking Section ────────────────────────────────────────────────────── */
 
 .thinking-section {
